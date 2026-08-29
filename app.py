@@ -19,7 +19,9 @@ from stock_analysis.paper import PaperTradingService
 from stock_analysis.scoring import evaluate_all_horizons
 
 
-st.set_page_config(page_title="A股智能分析", page_icon="📈", layout="wide")
+APP_VERSION = "v0.01 内部测试版"
+
+st.set_page_config(page_title=f"A股智能分析 · {APP_VERSION}", page_icon="📈", layout="wide")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SOURCE_LABELS = {
@@ -769,7 +771,7 @@ def show_portfolio(service: PaperTradingService, symbol: str | None = None, pric
 def main() -> None:
     initialize_session_state()
     st.title("📈 A股股票分析与模拟交易")
-    st.caption("真实收盘日线 · 透明规则评分 · 虚拟资金，不连接真实券商")
+    st.caption(f"{APP_VERSION} · 真实收盘日线 · 透明规则评分 · 虚拟资金，不连接真实券商")
     st.info("本工具仅供研究和学习参考，不构成投资建议。数据可能存在延迟、缺失或接口异常。")
 
     with st.sidebar:
