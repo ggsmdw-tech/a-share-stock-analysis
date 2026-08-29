@@ -30,6 +30,50 @@ SOURCE_LABELS = {
     "tencent": "腾讯公开行情",
     "sqlite-cache": "本地公开数据缓存",
 }
+FINANCIAL_METRIC_GUIDE = (
+    {
+        "key": "pe",
+        "label": "PE（市盈率）",
+        "meaning": "股价相当于公司一年每股盈利的多少倍。PE为20，粗略理解为市场愿意用20元买公司1元的年度盈利。",
+        "reading": "通常越低代表估值压力越小，但低PE也可能意味着市场担心公司未来盈利下降；应和同行业、公司历史水平比较。",
+        "scoring": "≤15分档80；15–30分档60；30–50分档40；>50分档20。",
+    },
+    {
+        "key": "pb",
+        "label": "PB（市净率）",
+        "meaning": "股价相对于每股净资产的倍数。PB为2，粗略理解为市场愿意用2元买公司账面上1元的净资产。",
+        "reading": "通常越低代表相对净资产的估值越低，但净资产的质量、行业盈利能力和资产轻重都会影响意义。",
+        "scoring": "≤1.5分档80；1.5–3分档60；3–6分档40；>6分档20。",
+    },
+    {
+        "key": "roe",
+        "label": "ROE（净资产收益率）",
+        "meaning": "公司用股东投入的每100元资金，一年赚取多少元利润。例如ROE为15%，表示每100元股东权益约产生15元利润。",
+        "reading": "较高且稳定通常说明资金使用效率较好，但高负债也可能抬高ROE；应观察连续多年和同行业对比。",
+        "scoring": "≥15%分档80；10%–15%分档65；5%–10%分档45；<5%分档25。",
+    },
+    {
+        "key": "revenue_growth",
+        "label": "营收增速",
+        "meaning": "公司销售收入相比上一报告期增长或下降的幅度，反映业务规模是在扩大还是收缩。",
+        "reading": "增长是积极信号，但营收增加不等于利润增加，还要结合利润增速、现金流和毛利率判断质量。",
+        "scoring": "≥20%分档85；10%–20%分档70；0%–10%分档55；-10%–0%分档35；<-10%分档15。",
+    },
+    {
+        "key": "profit_growth",
+        "label": "利润增速",
+        "meaning": "公司净利润相比上一报告期增长或下降的幅度，直接反映赚到的钱是在增加还是减少。",
+        "reading": "利润增长通常比单纯营收增长更重要，但一次性收益、低基数或会计变化可能造成短期失真，应查看报告说明。",
+        "scoring": "≥20%分档85；10%–20%分档70；0%–10%分档55；-10%–0%分档35；<-10%分档15。",
+    },
+    {
+        "key": "debt_ratio",
+        "label": "资产负债率",
+        "meaning": "公司资产中有多少比例来自负债。资产负债率为60%，可粗略理解为每100元资产中有60元来自借款或应付款。",
+        "reading": "通常越低代表财务杠杆和偿债压力越小，但合理水平因行业不同而不同；房地产、金融等行业不能直接套用普通行业标准。",
+        "scoring": "≤40%分档80；40%–60%分档60；60%–80%分档35；>80%分档15。",
+    },
+)
 
 
 @st.cache_resource
@@ -134,6 +178,43 @@ def format_percent(value) -> str:
         return "—"
     value = float(value)
     return f"{value * 100:.2f}%" if abs(value) < 2 else f"{value:.2f}%"
+
+
+def format_financial_value(key: str, value) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if pd.isna(number):
+        return "—"
+    if key in {"roe", "revenue_growth", "profit_growth", "debt_ratio"}:
+        return f"{number:.2f}%"
+    return f"{number:.2f}"
+
+
+def show_financial_metric_guide(financials: dict) -> None:
+    st.subheader("指标说明（通俗版）")
+    st.caption(
+        "PE、PB主要看估值贵不贵；ROE看赚钱效率；营收和利润增速看成长；"
+        "资产负债率看负债压力。以下解释用于帮助理解，不代表单项指标达到某个数值就一定该买或该卖。"
+    )
+    guide_cols = st.columns(2)
+    for index, item in enumerate(FINANCIAL_METRIC_GUIDE):
+        with guide_cols[index % 2]:
+            with st.container(border=True):
+                st.markdown(f"**{item['label']}**")
+                st.write("当前值：", format_financial_value(item["key"], financials.get(item["key"])))
+                st.write("它表示什么：", item["meaning"])
+                st.write("一般怎么看：", item["reading"])
+                st.caption(f"本应用评分参考：{item['scoring']}")
+    st.info(
+        "阅读建议：先看估值（PE/PB），再看盈利质量（ROE/资产负债率），"
+        "最后看成长（营收增速/利润增速）。财务指标只参与波段和中长期评分，"
+        "还会与技术趋势、动量和量价因素一起计算，不能单独替代完整财报分析。",
+        icon=":material/menu_book:",
+    )
 
 
 def show_scoring_guide() -> None:
@@ -895,10 +976,10 @@ def main() -> None:
         with tabs[2]:
             labels = {"pe": "PE", "pb": "PB", "roe": "ROE（%）", "revenue_growth": "营收增速（%）", "profit_growth": "利润增速（%）", "debt_ratio": "资产负债率（%）"}
             financial_frame = pd.DataFrame(
-                [{"指标": label, "数值": financials.get(key, "—")} for key, label in labels.items()]
+                [{"指标": label, "数值": format_financial_value(key, financials.get(key))} for key, label in labels.items()]
             )
             st.dataframe(financial_frame, width="stretch", hide_index=True)
-            st.caption("估值和财务评分使用公开字段的简化分档，不能替代完整财报研究。")
+            show_financial_metric_guide(financials)
 
     if tabs[3].open:
         with tabs[3]:
