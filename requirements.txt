@@ -1,0 +1,7 @@
+streamlit>=1.57,<2
+altair>=5.0
+pandas>=2.0
+numpy>=1.24
+akshare>=1.15
+requests>=2.31
+pytest>=8.0
