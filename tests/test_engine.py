@@ -191,6 +191,33 @@ def test_live_valuation_is_merged_into_cached_financials(tmp_path):
     assert financials["roe"] == 18.0
 
 
+def test_incomplete_cached_financials_refresh_valuation(tmp_path):
+    store = SQLiteStore(tmp_path / "incomplete-financials.db")
+    security = Security("600519", "贵州茅台", "SSE")
+    store.save_financials(
+        security.symbol,
+        {"roe": 18.0, "risk_flags": []},
+        source="public",
+    )
+    provider = object.__new__(PublicDataProvider)
+    provider.ak = None
+    provider.latest_valuation = {}
+    refresh_calls = []
+
+    def refresh_valuation(item):
+        refresh_calls.append(item.code)
+        provider.latest_valuation = {"pe": 22.0, "pb": 3.0}
+        return provider.latest_valuation
+
+    provider.refresh_valuation = refresh_valuation
+    financials = StockDataService(provider, store).load_financials(security)
+
+    assert financials["pe"] == 22.0
+    assert financials["pb"] == 3.0
+    assert financials["roe"] == 18.0
+    assert refresh_calls == ["600519"]
+
+
 def test_csv_provider_uses_uploaded_prices_only():
     frame = pd.DataFrame({"日期": pd.date_range("2026-01-01", periods=3), "开盘": [10, 11, 12], "最高": [11, 12, 13], "最低": [9, 10, 11], "收盘": [10.5, 11.5, 12.5], "成交量": [100, 110, 120]})
     provider = CsvDataProvider(frame)
@@ -207,6 +234,64 @@ def test_source_aware_price_cache_keeps_real_sources_separate(tmp_path):
     akshare = store.load_price_bars("SZSE.000001", date(2026, 1, 2), date(2026, 1, 2), sources=("akshare",))
     assert tencent["close"].tolist() == [10.5]
     assert akshare["close"].tolist() == [11.5]
+
+
+def test_money_flow_is_normalized_cached_and_uses_stale_cache(tmp_path):
+    class FlowProvider(FixtureProvider):
+        def __init__(self):
+            self.fail = False
+
+        def load_money_flow(self, security, start_date, end_date):
+            if self.fail:
+                raise ConnectionError("money flow blocked")
+            return pd.DataFrame(
+                {
+                    "日期": ["2026-01-02", "2026-01-05"],
+                    "主力净流入-净额": [100_000_000, -20_000_000],
+                    "主力净流入-净占比": [2.5, -0.6],
+                    "收盘价": [10.0, 10.2],
+                    "涨跌幅": [1.0, -0.5],
+                }
+            )
+
+    provider = FlowProvider()
+    store = SQLiteStore(tmp_path / "money-flow.db")
+    service = StockDataService(provider, store)
+    security = provider.SECURITY
+    fresh = service.load_money_flow(security, date(2026, 1, 1), date(2026, 1, 6))
+
+    assert fresh.status == "ok"
+    assert fresh.source == "akshare"
+    assert fresh.data["main_net_inflow"].tolist() == [100_000_000, -20_000_000]
+    assert fresh.data["main_net_ratio"].tolist() == [2.5, -0.6]
+
+    provider.fail = True
+    stale = service.load_money_flow(security, date(2026, 1, 1), date(2026, 1, 6))
+    assert stale.status == "stale-cache"
+    assert stale.source == "sqlite-cache"
+    assert stale.data["main_net_inflow"].tolist() == [100_000_000, -20_000_000]
+
+
+def test_public_money_flow_maps_exchange_to_akshare(monkeypatch):
+    calls = []
+
+    class FakeAkShare:
+        def stock_individual_fund_flow(self, **kwargs):
+            calls.append(kwargs)
+            return pd.DataFrame(
+                {
+                    "日期": ["2026-01-02"],
+                    "主力净流入-净额": [1000],
+                }
+            )
+
+    provider = object.__new__(PublicDataProvider)
+    provider.ak = FakeAkShare()
+    provider.last_money_flow_source = "akshare"
+    result = provider.load_money_flow(Security("600519", "贵州茅台", "SSE"), date(2026, 1, 1), date(2026, 1, 3))
+
+    assert result["主力净流入-净额"].tolist() == [1000]
+    assert calls == [{"stock": "600519", "market": "sh"}]
 
 
 def test_security_and_financial_cache(tmp_path):

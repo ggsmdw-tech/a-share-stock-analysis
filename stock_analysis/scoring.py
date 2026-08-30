@@ -297,6 +297,18 @@ def evaluate_stock(
         "利润增速": financials.get("profit_growth"),
         "资产负债率": financials.get("debt_ratio"),
     }
+    entry_conditions = [
+        f"综合评分达到70分及以上时，{HORIZONS[horizon]}规则进入买入候选区间",
+        "同时检查本周期所列趋势、动量、量价、估值或财务质量维度",
+    ]
+    exit_conditions = [
+        "综合评分低于45分时，基础规则进入减仓/卖出倾向",
+        "评分处于45–69.9分时，基础规则保持观望/持有，不单独触发买卖",
+    ]
+    risk_controls = [
+        "关键指标缺失、数据过期、停牌或风险标记出现时，不生成方向性信号",
+        "基础规则评分不是上涨概率、准确率或未来收益保证",
+    ]
     return AnalysisResult(
         security=snapshot.security,
         horizon=HORIZONS[horizon],
@@ -309,6 +321,10 @@ def evaluate_stock(
         reasons=reasons,
         warnings=warnings,
         key_metrics=key_metrics,
+        strategy_name="基础综合评分",
+        entry_conditions=entry_conditions,
+        exit_conditions=exit_conditions,
+        risk_controls=risk_controls,
     )
 
 

@@ -12,7 +12,7 @@ import pandas as pd
 import requests
 
 from .db import SQLiteStore
-from .models import PriceHistory, Security
+from .models import MoneyFlowHistory, PriceHistory, Security
 
 
 KNOWN_SECURITY_NAMES = {
@@ -71,6 +71,82 @@ def _standardize_bars(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[["date", "open", "high", "low", "close", "volume", "amount"]]
 
 
+def _standardize_money_flow(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize provider-estimated daily fund-flow fields."""
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        raise ValueError("公开主力资金接口返回空数据")
+
+    aliases = {
+        "date": ["date", "日期", "交易日期"],
+        "main_net_inflow": [
+            "main_net_inflow",
+            "主力净流入-净额",
+            "主力净流入净额",
+            "主力净流入",
+        ],
+        "main_net_ratio": [
+            "main_net_ratio",
+            "主力净流入-净占比",
+            "主力净流入净占比",
+        ],
+        "close": ["close", "收盘价", "收盘"],
+        "change": ["change", "涨跌幅", "涨跌"],
+        "super_large_net_inflow": ["超大单净流入-净额", "超大单净流入"],
+        "large_net_inflow": ["大单净流入-净额", "大单净流入"],
+        "medium_net_inflow": ["中单净流入-净额", "中单净流入"],
+        "small_net_inflow": ["小单净流入-净额", "小单净流入"],
+    }
+    normalized_columns = {
+        str(column).strip().lower().replace(" ", ""): column
+        for column in frame.columns
+    }
+    selected: dict[str, Any] = {}
+    for target, candidates in aliases.items():
+        for candidate in candidates:
+            source_column = normalized_columns.get(candidate.lower().replace(" ", ""))
+            if source_column is not None:
+                selected[target] = source_column
+                break
+
+    missing = [key for key in ("date", "main_net_inflow") if key not in selected]
+    if missing:
+        raise ValueError(f"主力资金数据缺少字段: {', '.join(missing)}")
+
+    result = pd.DataFrame()
+    for target, source_column in selected.items():
+        result[target] = frame[source_column]
+    for column in aliases:
+        if column not in result:
+            result[column] = np.nan
+
+    result["date"] = pd.to_datetime(result["date"], errors="coerce")
+    for column in result.columns:
+        if column != "date":
+            result[column] = pd.to_numeric(
+                result[column].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
+                errors="coerce",
+            )
+    result = (
+        result.dropna(subset=["date", "main_net_inflow"])
+        .sort_values("date")
+        .drop_duplicates("date")
+        .reset_index(drop=True)
+    )
+    return result[
+        [
+            "date",
+            "main_net_inflow",
+            "main_net_ratio",
+            "close",
+            "change",
+            "super_large_net_inflow",
+            "large_net_inflow",
+            "medium_net_inflow",
+            "small_net_inflow",
+        ]
+    ]
+
+
 class StockDataProvider(ABC):
     source_name = "unknown"
 
@@ -93,6 +169,11 @@ class StockDataProvider(ABC):
 
     @abstractmethod
     def load_market_data(
+        self, security: Security, start_date: date, end_date: date
+    ) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def load_money_flow(
         self, security: Security, start_date: date, end_date: date
     ) -> pd.DataFrame:
         raise NotImplementedError
@@ -151,6 +232,7 @@ class PublicDataProvider(StockDataProvider):
         self.last_resolution_note = ""
         self.last_market_data_note = ""
         self.last_market_data_source = self.source_name
+        self.last_money_flow_source = "akshare"
         self.latest_valuation: dict[str, float | None] = {}
 
     def resolve_candidates(self, query: str) -> list[Security]:
@@ -331,6 +413,26 @@ class PublicDataProvider(StockDataProvider):
             raise ValueError("腾讯公开行情接口返回空数据")
         return _standardize_bars(pd.concat(frames, ignore_index=True))
 
+    def load_money_flow(
+        self, security: Security, start_date: date, end_date: date
+    ) -> pd.DataFrame:
+        if self.ak is None:
+            raise RuntimeError("主力资金数据需要安装 AKShare 公开数据接口。")
+        market = {"SSE": "sh", "SZSE": "sz", "BSE": "bj"}.get(
+            security.exchange
+        )
+        if market is None:
+            raise ValueError("暂不支持该股票交易所的主力资金数据")
+        try:
+            frame = self.ak.stock_individual_fund_flow(
+                stock=security.code,
+                market=market,
+            )
+        except Exception as exc:
+            raise RuntimeError("公开主力资金接口暂时不可用，请检查网络或稍后重试。") from exc
+        self.last_money_flow_source = "akshare"
+        return frame
+
     def _resolve_tencent_quote(self, code: str) -> str | None:
         prefix = {"SSE": "sh", "SZSE": "sz", "BSE": "bj"}.get(exchange_for_code(code))
         if prefix is None:
@@ -361,6 +463,11 @@ class PublicDataProvider(StockDataProvider):
         except Exception:
             return None
 
+    def refresh_valuation(self, security: Security) -> dict[str, float | None]:
+        """Refresh quote valuation fields when a financial cache is incomplete."""
+        self._resolve_tencent_quote(security.code)
+        return dict(self.latest_valuation)
+
     @staticmethod
     def _parse_tencent_payload(text: str) -> dict[str, Any]:
         value = str(text or "").strip()
@@ -389,6 +496,7 @@ class PublicDataProvider(StockDataProvider):
             frame = self.ak.stock_financial_analysis_indicator(symbol=security.code)
         except Exception:
             return {}
+
         if frame is None or frame.empty:
             return {}
         row = frame.iloc[-1].to_dict()
@@ -481,13 +589,28 @@ class StockDataService:
             return PriceHistory(security, pd.DataFrame(), self.provider.source_name, "error", message)
 
     def load_financials(self, security: Security) -> dict[str, Any]:
-        live_valuation = getattr(self.provider, "latest_valuation", {})
+        live_valuation = dict(getattr(self.provider, "latest_valuation", {}) or {})
         if self.store is not None:
             cached = self.store.load_financials(
                 security.symbol,
                 sources=(self.provider.source_name, "akshare"),
             )
             if cached is not None:
+                cached_has_valuation = all(
+                    cached.get(key) is not None for key in ("pe", "pb")
+                )
+                live_valuation_complete = all(
+                    live_valuation.get(key) is not None for key in ("pe", "pb")
+                )
+                if not cached_has_valuation and not live_valuation_complete:
+                    refresh = getattr(self.provider, "refresh_valuation", None)
+                    if callable(refresh):
+                        try:
+                            refreshed = refresh(security)
+                        except Exception:
+                            refreshed = {}
+                        if isinstance(refreshed, dict):
+                            live_valuation.update(refreshed)
                 if live_valuation:
                     cached = {**cached, **live_valuation}
                 return cached
@@ -504,6 +627,46 @@ class StockDataService:
             return financials
         except Exception:
             return {}
+
+    def load_money_flow(
+        self, security: Security, start_date: date, end_date: date
+    ) -> MoneyFlowHistory:
+        source = getattr(self.provider, "last_money_flow_source", "akshare")
+        try:
+            frame = _standardize_money_flow(
+                self.provider.load_money_flow(security, start_date, end_date)
+            )
+            frame = frame[
+                (frame["date"].dt.date >= start_date)
+                & (frame["date"].dt.date <= end_date)
+            ].copy()
+            if frame.empty:
+                raise ValueError("所选日期范围内没有主力资金数据")
+            source = getattr(self.provider, "last_money_flow_source", source)
+            if self.store is not None:
+                self.store.upsert_money_flow(security.symbol, frame, source=source)
+            return MoneyFlowHistory(security, frame, source, status="ok")
+        except Exception as exc:
+            if self.store is not None:
+                cached = self.store.load_money_flow(
+                    security.symbol,
+                    start_date,
+                    end_date,
+                    sources=(source, self.provider.source_name, "akshare"),
+                )
+                if not cached.empty:
+                    return MoneyFlowHistory(
+                        security,
+                        cached,
+                        "sqlite-cache",
+                        status="stale-cache",
+                        message="公开主力资金接口获取失败，已使用本地缓存；请查看数据日期后再作研究。",
+                    )
+            if isinstance(exc, (ValueError, LookupError, RuntimeError)):
+                message = str(exc)
+            else:
+                message = "公开主力资金数据暂时不可用，请检查网络或稍后重试。"
+            return MoneyFlowHistory(security, pd.DataFrame(), source, status="error", message=message)
 
 
 def create_provider(mode: str = "public") -> StockDataProvider:
