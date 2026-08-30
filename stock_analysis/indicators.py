@@ -17,6 +17,8 @@ def calculate_indicators(price_history: PriceHistory) -> IndicatorSnapshot:
         raise ValueError(f"历史数据不足，至少需要 {MINIMUM_BARS} 个交易日")
     frame = frame.sort_values("date").drop_duplicates("date").reset_index(drop=True)
     close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
     volume = pd.to_numeric(frame["volume"], errors="coerce").fillna(0)
 
     frame["sma5"] = close.rolling(5).mean()
@@ -43,7 +45,21 @@ def calculate_indicators(price_history: PriceHistory) -> IndicatorSnapshot:
     frame["return1"] = close.pct_change()
     frame["volatility20"] = frame["return1"].rolling(20).std() * np.sqrt(252)
     frame["volume_avg20"] = volume.rolling(20).mean()
+    frame["volume_ratio20"] = volume / frame["volume_avg20"].replace(0, np.nan)
     frame["drawdown"] = close / close.cummax() - 1
+
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - previous_close).abs(), (low - previous_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    frame["atr14"] = true_range.rolling(14).mean()
+    frame["atr_ratio"] = frame["atr14"] / close.replace(0, np.nan)
+    frame["roc20"] = close.pct_change(20)
+    frame["roc60"] = close.pct_change(60)
+    frame["sma60_slope20"] = frame["sma60"] / frame["sma60"].shift(20) - 1
+    frame["macd_hist_change"] = frame["macd_hist"].diff()
+    frame["high20_prev"] = high.rolling(20).max().shift(1)
 
     latest = frame.iloc[-1].to_dict()
     return IndicatorSnapshot(price_history.security, frame, latest, price_history.status, price_history.message)

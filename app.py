@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from html import escape
+import math
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import uuid
@@ -10,16 +11,20 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-from stock_analysis.backtest import BacktestReport, backtest_buy_signals
+from stock_analysis.backtest import BacktestReport, backtest_buy_signals, backtest_strategy
 from stock_analysis.data import StockDataService, create_provider
 from stock_analysis.db import SQLiteStore
 from stock_analysis.indicators import calculate_indicators
-from stock_analysis.models import IndicatorSnapshot, Security
+from stock_analysis.models import IndicatorSnapshot, MoneyFlowHistory, PriceHistory, Security
 from stock_analysis.paper import PaperTradingService
+from stock_analysis.position import recommend_position_action
+from stock_analysis.quality import assess_data_quality
 from stock_analysis.scoring import evaluate_all_horizons
+from stock_analysis.strategy import DEFAULT_STRATEGY, evaluate_strategy
 
 
-APP_VERSION = "v0.01 内部测试版"
+APP_VERSION = "v0.02 数据可信度版"
+LOCAL_ACCOUNT_ID = "local-default"
 
 st.set_page_config(page_title=f"A股智能分析 · {APP_VERSION}", page_icon="📈", layout="wide")
 
@@ -83,15 +88,82 @@ def get_store() -> SQLiteStore:
 
 def initialize_session_state() -> None:
     shared_symbol = str(st.query_params.get("symbol", "")).strip()
+    previous_account_id = st.session_state.get("paper_account_id")
+    previous_watchlist = st.session_state.get("watchlist")
+    previous_recent_queries = st.session_state.get("recent_queries")
+    previous_analysis_snapshots = st.session_state.get("analysis_snapshots")
+    account_id = get_paper_account_id()
+    store = get_store()
+    if _is_local_runtime():
+        store.migrate_latest_session_account(LOCAL_ACCOUNT_ID)
     st.session_state.setdefault("analysis_query", shared_symbol or "600519")
     st.session_state.setdefault("auto_analyze", bool(shared_symbol))
-    st.session_state.setdefault("watchlist", {})
-    st.session_state.setdefault("recent_queries", [])
-    st.session_state.setdefault("analysis_snapshots", {})
+    if st.session_state.get("_persistence_loaded_account") != account_id:
+        if previous_account_id and previous_account_id != account_id:
+            if isinstance(previous_watchlist, dict):
+                for item in previous_watchlist.values():
+                    try:
+                        store.save_watchlist_item(
+                            account_id,
+                            Security(
+                                item["code"],
+                                item["name"],
+                                item["exchange"],
+                                item.get("market_status", "正常"),
+                            ),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            if isinstance(previous_recent_queries, list):
+                for item in previous_recent_queries:
+                    try:
+                        store.save_recent_query(
+                            account_id,
+                            Security(
+                                item["code"],
+                                item["name"],
+                                item["exchange"],
+                                item.get("market_status", "正常"),
+                            ),
+                            item.get("as_of"),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            if isinstance(previous_analysis_snapshots, dict):
+                for symbol, item in previous_analysis_snapshots.items():
+                    if not isinstance(item, dict):
+                        continue
+                    store.save_analysis_snapshot(
+                        account_id,
+                        symbol,
+                        item.get("price"),
+                        item.get("score"),
+                        item.get("as_of"),
+                    )
+
+        loaded_watchlist = store.load_watchlist(account_id)
+        st.session_state["watchlist"] = {
+            item.symbol: {
+                "symbol": item.symbol,
+                "code": item.code,
+                "name": item.name,
+                "exchange": item.exchange,
+                "market_status": item.market_status,
+            }
+            for item in loaded_watchlist
+        }
+        st.session_state["recent_queries"] = store.load_recent_queries(account_id, limit=10)
+        st.session_state["analysis_snapshots"] = store.load_analysis_snapshots(
+            account_id, limit=30
+        )
+        st.session_state["_persistence_loaded_account"] = account_id
+        if not shared_symbol and not previous_account_id and st.session_state["recent_queries"]:
+            st.session_state["analysis_query"] = st.session_state["recent_queries"][0]["code"]
     st.session_state.setdefault("analysis_alerts", [])
     st.session_state.setdefault("alerts_enabled", True)
     st.session_state.setdefault("price_alert_threshold", 3.0)
     st.session_state.setdefault("score_alert_threshold", 5.0)
+    st.session_state.setdefault("current_holding_ratio_pct", 0.0)
 
 
 def build_share_url(symbol: str) -> str:
@@ -116,6 +188,11 @@ def remember_query(security: Security, history) -> None:
         },
     )
     st.session_state["recent_queries"] = recent[:10]
+    get_store().save_recent_query(
+        get_paper_account_id(),
+        security,
+        history.as_of,
+    )
 
 
 def record_change_alerts(security: Security, indicators, result) -> list[str]:
@@ -149,6 +226,13 @@ def record_change_alerts(security: Security, indicators, result) -> list[str]:
         "as_of": current_date,
     }
     st.session_state["analysis_snapshots"] = dict(list(snapshots.items())[-30:])
+    get_store().save_analysis_snapshot(
+        get_paper_account_id(),
+        symbol,
+        latest_price,
+        current_score,
+        current_date,
+    )
     return alerts
 
 
@@ -165,6 +249,32 @@ def run_historical_backtest(
     security = Security(code, name, exchange, market_status)
     snapshot = IndicatorSnapshot(security, frame, frame.iloc[-1].to_dict(), status, message)
     return backtest_buy_signals(snapshot)
+
+
+@st.cache_data(ttl="1h", max_entries=20)
+def run_optimized_backtest(
+    frame: pd.DataFrame,
+    code: str,
+    name: str,
+    exchange: str,
+    market_status: str,
+    status: str,
+    message: str,
+) -> BacktestReport:
+    security = Security(code, name, exchange, market_status)
+    snapshot = IndicatorSnapshot(security, frame, frame.iloc[-1].to_dict(), status, message)
+    return backtest_strategy(snapshot, DEFAULT_STRATEGY, validation_mode="rolling")
+
+
+@st.cache_data(ttl="30m", max_entries=20)
+def load_money_flow_view(
+    code: str, name: str, exchange: str, refresh_token: int = 0
+) -> MoneyFlowHistory:
+    """Load public estimated money flow without blocking the main analysis."""
+    security = Security(code, name, exchange)
+    service = StockDataService(create_provider("public"), get_store())
+    start = date.today() - timedelta(days=365 * 3)
+    return service.load_money_flow(security, start, date.today())
 
 
 def format_number(value, digits: int = 2) -> str:
@@ -192,6 +302,118 @@ def format_financial_value(key: str, value) -> str:
     if key in {"roe", "revenue_growth", "profit_growth", "debt_ratio"}:
         return f"{number:.2f}%"
     return f"{number:.2f}"
+
+
+def format_money_flow_amount(value) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    value = float(value)
+    if abs(value) >= 100_000_000:
+        return f"{value / 100_000_000:+.2f}亿元"
+    if abs(value) >= 10_000:
+        return f"{value / 10_000:+.2f}万元"
+    return f"{value:+,.0f}元"
+
+
+def format_money_flow_ratio(value) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):+.2f}%"
+
+
+def build_money_flow_chart(frame: pd.DataFrame) -> alt.Chart:
+    """Build a recent daily main-money net-flow bar chart."""
+    chart_frame = frame.tail(180).copy()
+    chart_frame["inflow_yi"] = chart_frame["main_net_inflow"] / 100_000_000
+    chart_frame["direction"] = chart_frame["inflow_yi"] >= 0
+    return (
+        alt.Chart(chart_frame)
+        .mark_bar()
+        .encode(
+            x=alt.X("date:T", title=None, axis=alt.Axis(format="%Y-%m")),
+            y=alt.Y("inflow_yi:Q", title="主力净流入（亿元）"),
+            color=alt.condition("datum.direction", alt.value("#d94b4b"), alt.value("#16856a")),
+            tooltip=[
+                alt.Tooltip("date:T", title="日期", format="%Y-%m-%d"),
+                alt.Tooltip("inflow_yi:Q", title="主力净流入（亿元）", format="+.2f"),
+                alt.Tooltip("main_net_ratio:Q", title="主力净流入占比（%）", format="+.2f"),
+            ],
+        )
+        .properties(height=360)
+        .interactive()
+    )
+
+
+def show_money_flow(security: Security) -> None:
+    """Show provider-estimated daily main-money flow and transparent caveats."""
+    st.subheader("每日主力资金")
+    st.caption(
+        "主力资金是公开数据服务商按大单/超大单成交估算的净流入，不是交易所公布的唯一真实主力账户数据；"
+        "正数表示估算净流入，负数表示估算净流出。"
+    )
+    refresh_token = int(st.session_state.get("money_flow_refresh_token", 0))
+    if st.button("刷新资金流数据", key=f"money_flow_refresh_{security.symbol}", icon=":material/refresh:"):
+        st.session_state["money_flow_refresh_token"] = refresh_token + 1
+        st.rerun()
+
+    with st.spinner("正在获取每日主力资金数据…"):
+        flow = load_money_flow_view(
+            security.code, security.name, security.exchange, refresh_token
+        )
+    if flow.data.empty:
+        st.warning(flow.message or "当前没有可用的公开主力资金数据。", icon=":material/data_alert:")
+        st.caption("接口失败、限流或字段变化时不会填充虚构数据；请稍后点击“刷新资金流数据”重试。")
+        return
+    if flow.status == "stale-cache":
+        st.warning(flow.message, icon=":material/cloud_off:")
+
+    frame = flow.data.copy()
+    latest = frame.iloc[-1]
+    latest_flow = float(latest["main_net_inflow"])
+    non_zero = frame[frame["main_net_inflow"] != 0]
+    direction = 1 if latest_flow > 0 else -1 if latest_flow < 0 else 0
+    streak = 0
+    if direction:
+        for value in reversed(non_zero["main_net_inflow"].tolist()):
+            if (value > 0 and direction > 0) or (value < 0 and direction < 0):
+                streak += 1
+            else:
+                break
+    streak_text = "资金基本持平" if not direction else f"连续{streak}日净{"流入" if direction > 0 else "流出"}"
+    last_5 = frame.tail(5)["main_net_inflow"].sum()
+    last_20 = frame.tail(20)["main_net_inflow"].sum()
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("最近交易日主力净流入", format_money_flow_amount(latest_flow))
+    metric_cols[1].metric("主力净流入占比", format_money_flow_ratio(latest.get("main_net_ratio")))
+    metric_cols[2].metric("近5日累计净流入", format_money_flow_amount(last_5))
+    metric_cols[3].metric("连续资金方向", streak_text)
+
+    if latest_flow > 0:
+        st.success("最近交易日为公开估算的主力净流入，属于资金进场迹象；不能单独作为买入信号。", icon=":material/trending_up:")
+    elif latest_flow < 0:
+        st.warning("最近交易日为公开估算的主力净流出，属于资金离场迹象；不能单独作为卖出信号。", icon=":material/trending_down:")
+    else:
+        st.info("最近交易日主力资金估算接近持平，暂未形成明显进场或离场方向。", icon=":material/remove:")
+
+    st.caption(
+        f"数据源：{SOURCE_LABELS.get(flow.source, flow.source)}　资金流最新日期：{flow.as_of or '—'}　"
+        f"近20日累计：{format_money_flow_amount(last_20)}"
+    )
+    st.altair_chart(build_money_flow_chart(frame), width="stretch")
+    display_frame = frame.tail(30).sort_values("date", ascending=False).copy()
+    display_frame["日期"] = display_frame["date"].dt.strftime("%Y-%m-%d")
+    display_frame["主力净流入"] = display_frame["main_net_inflow"].map(format_money_flow_amount)
+    display_frame["主力净流入占比"] = display_frame["main_net_ratio"].map(format_money_flow_ratio)
+    display_frame["收盘价"] = display_frame["close"].map(format_number)
+    display_frame["涨跌幅"] = display_frame["change"].map(format_money_flow_ratio)
+    display_frame = display_frame[["日期", "主力净流入", "主力净流入占比", "收盘价", "涨跌幅"]]
+    st.dataframe(display_frame, width="stretch", hide_index=True)
+    st.info(
+        "阅读提示：资金净流入只能说明当日估算的大单成交方向，可能受对倒、涨跌停、成交结构和数据商算法影响。"
+        "应和价格趋势、成交量、财务指标及历史验证一起看，本页面不把资金流向直接转换成买卖结论。",
+        icon=":material/menu_book:",
+    )
 
 
 def show_financial_metric_guide(financials: dict) -> None:
@@ -232,6 +454,46 @@ def show_scoring_guide() -> None:
         )
         st.caption("以上是规则筛选结果，不代表确定的买卖结论；实际操作还需结合个人风险承受能力。")
 
+        st.markdown("**先看懂两个规则倾向百分比**")
+        st.markdown(
+            "- **买入规则倾向**：等于综合评分，表示当前数据对‘没有持仓时考虑新建仓’的支持程度。"
+            "例如综合评分 72 分，页面显示 72%，意思是规则支持度达到买入候选区间，不是有 72% 的上涨概率。\n"
+            "- **卖出规则倾向**：等于 100 − 综合评分，表示当前数据对‘已有持仓时减仓或卖出’的相对倾向。"
+            "例如综合评分 38 分，页面显示 62%，并且低于45分卖出阈值，因此规则偏向减仓/卖出。\n"
+            "- **45–69.9 分的特殊情况**：买入倾向和卖出倾向都没有达到各自的明确触发条件，页面会显示观望/持有，"
+            "不代表既要买入又要卖出。\n"
+            "- 两个百分比只是把同一个 0–100 分规则结果换成容易阅读的方向展示，**不是上涨/下跌概率、历史胜率、准确率或建议仓位比例**。"
+        )
+        st.info(
+            "阅读顺序：先看你属于‘没有持仓’还是‘已有持仓’，再看对应依据和阈值。"
+            "买入候选只表示值得进一步研究，不表示立即买入；卖出倾向也不替代对成本价、仓位和风险承受能力的判断。",
+            icon=":material/info:",
+        )
+
+        st.markdown("**综合评分是怎样算出来的**")
+        st.markdown(
+            "1. 先把每个评分维度换算成 **0–100 分**：50分代表中性，分数越高代表该维度越有利，分数越低代表越不利。\n"
+            "2. 根据分析周期给每个维度分配权重。例如短线更重视趋势和动量，中长期更重视估值、盈利质量和成长。\n"
+            "3. 将‘单项分数 × 对应权重’相加，得到综合评分。举例：某短线股票趋势80分、动量60分、量价50分、风险70分，"
+            "综合评分 = 80×35% + 60×25% + 50×20% + 70×20% = 67分，因此属于观望，而不是买入候选。"
+        )
+
+        st.markdown("**单项评分的具体规则（当前版本）**")
+        st.markdown(
+            "- **趋势**：收盘价在20日均线上方加18分、下方扣18分；20日均线在60日均线上方加22分、下方扣22分；从50分起算。\n"
+            "- **动量**：MACD柱为正加25分、为负扣25分；RSI在45–70加20分，超过80扣25分，低于30扣5分，其余加5分。\n"
+            "- **量价**：上涨且成交量至少是20日均量的1.1倍加30分；下跌且放量扣25分；量比低于0.7扣5分；其他上涨加5分、下跌扣5分。\n"
+            "- **风险**：从80分起算；年化波动率超过40%扣15分、超过60%再按更高风险扣35分；历史回撤低于−15%扣10分、低于−30%扣30分。\n"
+            "- **估值**：PE分别按≤15、≤30、≤50、>50分为80、60、40、20分；PB分别按≤1.5、≤3、≤6、>6分为80、60、40、20分，取可用指标平均值。\n"
+            "- **盈利质量**：ROE按≥15%、≥10%、≥5%、<5%分为80、65、45、25分；资产负债率按≤40%、≤60%、≤80%、>80%分为80、60、35、15分，取可用指标平均值。\n"
+            "- **成长**：营收增速和利润增速分别按≥20%、≥10%、≥0%、≥−10%、<−10%分为85、70、55、35、15分，取可用指标平均值。\n"
+            "- **长期趋势**：收盘价在60日均线上方加25分、下方扣25分；收盘价在120日均线上方加20分、下方扣20分；从50分起算。"
+        )
+        st.caption(
+            "PE、PB等估值分档是本应用的简化筛选规则，应结合同行业和该股票自身历史水平比较；"
+            "单一指标不能单独决定买卖。任一关键指标缺失、数据过期、停牌或有风险标记时，风险规则会覆盖评分，显示数据不足/不可判断。"
+        )
+
         st.markdown("**不同分析周期的权重**")
         st.markdown(
             "| 分析周期 | 评分维度及权重 |\n"
@@ -260,8 +522,48 @@ def show_scoring_guide() -> None:
         )
 
 
+def show_strategy_guide() -> None:
+    with st.expander("优化策略说明：趋势、动量、量价与风险如何共同决定", expanded=False):
+        st.markdown(
+            "**趋势动量波段策略**借鉴公开量化研究中常见的规则组合，不复制任何商业软件的私有代码。"
+            "它不是预测模型，而是把多个可观察条件组合成一个可回放的交易规则。"
+        )
+        st.markdown(
+            "- **趋势过滤（35%）**：收盘价在20日均线上方、20日均线在60日均线上方，且60日均线近20日向上。\n"
+            "- **动量确认（30%）**：20日和60日收益率为正，MACD柱为正且改善，RSI处于45–72适中区间。\n"
+            "- **量价确认（15%）**：成交量至少达到20日均量；上涨放量时得分更高。\n"
+            "- **波动风险（20%）**：年化波动率超过60%或当前回撤超过30%时，不允许新开仓。"
+        )
+        st.markdown(
+            "**买入规则**：综合评分达到70分，同时趋势、动量、量价和风险四类过滤条件全部通过。\n"
+            "**卖出规则**：入场后触及1.5×ATR止损、2.25×ATR止盈，或收盘跌破20日均线且MACD柱转负；"
+            "最长持有20个交易日，到期退出。"
+        )
+        st.markdown(
+            "**持仓比例联动规则**：买入候选时，评分70–84.9分的目标仓位约10%，评分85分及以上的目标仓位约15%，"
+            "单只股票最高按25%控制；观望/持有时不主动加仓；减仓/卖出倾向时，评分35–44.9分按当前持仓减少25%，"
+            "低于35分按当前持仓减少50%。"
+        )
+        st.caption(
+            "回测默认按100万元资金、单笔仓位上限25%计算，手续费0.03%（最低5元）、卖出印花税0.10%、滑点0.10%，"
+            "交易数量按100股整数倍。样本外统计使用历史后30%，不根据单只股票自动调参。"
+        )
+
+
+def _is_local_runtime() -> bool:
+    current_url = getattr(st.context, "url", "") or ""
+    host = (urlsplit(current_url).hostname or "").lower()
+    return not host or host in {"localhost", "127.0.0.1", "::1"}
+
+
 def get_paper_account_id() -> str:
-    """Keep paper-trading balances isolated when several people share one app."""
+    """Use a stable local account while isolating users on public deployments."""
+    previous_account_id = st.session_state.get("paper_account_id")
+    if _is_local_runtime():
+        if previous_account_id and previous_account_id != LOCAL_ACCOUNT_ID:
+            get_store().migrate_account(previous_account_id, LOCAL_ACCOUNT_ID)
+        st.session_state["paper_account_id"] = LOCAL_ACCOUNT_ID
+        return LOCAL_ACCOUNT_ID
     return st.session_state.setdefault("paper_account_id", f"session-{uuid.uuid4().hex}")
 
 
@@ -323,6 +625,126 @@ def run_analysis(query: str):
     return security, history, indicators, financials, results
 
 
+BENCHMARK_SECURITY = Security("000300", "沪深300", "SSE")
+
+
+@st.cache_data(ttl="30m", max_entries=20)
+def load_benchmark_history(start_date: date, end_date: date) -> PriceHistory:
+    """Load a broad market benchmark only when the market-comparison view opens."""
+    service = StockDataService(create_provider("public"), get_store())
+    return service.load_market_data(BENCHMARK_SECURITY, start_date, end_date)
+
+
+def _period_return(values: pd.Series, periods: int) -> float | None:
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if len(values) <= periods:
+        return None
+    return float(values.iloc[-1] / values.iloc[-periods - 1] - 1)
+
+
+def build_relative_performance_frame(
+    stock_history: PriceHistory, benchmark_history: PriceHistory
+) -> pd.DataFrame:
+    """Align a stock and CSI 300 on common dates and normalize both to 100."""
+    if stock_history.data.empty or benchmark_history.data.empty:
+        return pd.DataFrame()
+    stock = stock_history.data[["date", "close"]].copy()
+    benchmark = benchmark_history.data[["date", "close"]].copy()
+    stock["date"] = pd.to_datetime(stock["date"], errors="coerce")
+    benchmark["date"] = pd.to_datetime(benchmark["date"], errors="coerce")
+    stock["个股收盘"] = pd.to_numeric(stock["close"], errors="coerce")
+    benchmark["沪深300收盘"] = pd.to_numeric(benchmark["close"], errors="coerce")
+    frame = pd.merge(
+        stock[["date", "个股收盘"]],
+        benchmark[["date", "沪深300收盘"]],
+        on="date",
+        how="inner",
+    ).dropna()
+    if frame.empty:
+        return frame
+    frame = frame.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    frame["个股指数"] = frame["个股收盘"] / frame["个股收盘"].iloc[0] * 100
+    frame["沪深300指数"] = frame["沪深300收盘"] / frame["沪深300收盘"].iloc[0] * 100
+    return frame[["date", "个股指数", "沪深300指数"]]
+
+
+def show_market_comparison(security: Security, history: PriceHistory) -> None:
+    """Show market context without silently using it as a buy/sell signal."""
+    st.subheader("市场环境与沪深300对照")
+    st.caption(
+        "个股涨跌需要放在大盘环境中理解。这里使用同一日期区间的真实公开沪深300日线，"
+        "只做相对表现对照，不会自动改变当前策略评分。"
+    )
+    if history.data.empty or "date" not in history.data:
+        st.warning("当前没有足够的个股行情，暂时无法进行市场对照。", icon=":material/data_alert:")
+        return
+    start_date = pd.Timestamp(history.data["date"].min()).date()
+    end_date = pd.Timestamp(history.data["date"].max()).date()
+    with st.spinner("正在获取沪深300公开行情…"):
+        benchmark = load_benchmark_history(start_date, end_date)
+    if benchmark.data.empty:
+        st.warning(
+            benchmark.message or "沪深300公开行情暂时不可用，无法完成市场对照。",
+            icon=":material/data_alert:",
+        )
+        return
+    frame = build_relative_performance_frame(history, benchmark)
+    if len(frame) < 21:
+        st.warning("个股与沪深300的共同交易日不足21天，暂不显示相对表现。", icon=":material/data_alert:")
+        return
+
+    stock_returns = pd.to_numeric(frame["个股指数"], errors="coerce")
+    benchmark_returns = pd.to_numeric(frame["沪深300指数"], errors="coerce")
+    stock_return_20 = _period_return(stock_returns, 20)
+    benchmark_return_20 = _period_return(benchmark_returns, 20)
+    stock_return_60 = _period_return(stock_returns, 60)
+    benchmark_return_60 = _period_return(benchmark_returns, 60)
+    relative_20 = None if stock_return_20 is None or benchmark_return_20 is None else stock_return_20 - benchmark_return_20
+    relative_60 = None if stock_return_60 is None or benchmark_return_60 is None else stock_return_60 - benchmark_return_60
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("个股近20日", format_percent(stock_return_20))
+    metric_cols[1].metric("沪深300近20日", format_percent(benchmark_return_20))
+    metric_cols[2].metric("个股相对强弱（20日）", format_percent(relative_20))
+    metric_cols[3].metric("个股相对强弱（60日）", format_percent(relative_60))
+
+    if relative_20 is not None and relative_20 > 0:
+        st.success(f"{security.name}近20日跑赢沪深300约{relative_20:.2%}，相对表现偏强。", icon=":material/trending_up:")
+    elif relative_20 is not None and relative_20 < 0:
+        st.warning(f"{security.name}近20日跑输沪深300约{abs(relative_20):.2%}，个股上涨可能弱于市场。", icon=":material/trending_down:")
+    else:
+        st.info("近20日个股与沪深300表现接近，暂未形成明显相对强弱。", icon=":material/remove:")
+
+    chart_frame = frame.tail(260).copy()
+    long_frame = chart_frame.melt(
+        id_vars=["date"],
+        value_vars=["个股指数", "沪深300指数"],
+        var_name="序列",
+        value_name="基准化指数",
+    )
+    chart = (
+        alt.Chart(long_frame)
+        .mark_line()
+        .encode(
+            x=alt.X("date:T", title=None, axis=alt.Axis(format="%Y-%m")),
+            y=alt.Y("基准化指数:Q", title="基准化指数（共同起点=100）"),
+            color=alt.Color("序列:N", title=None),
+            tooltip=[
+                alt.Tooltip("date:T", title="日期", format="%Y-%m-%d"),
+                alt.Tooltip("序列:N", title="序列"),
+                alt.Tooltip("基准化指数:Q", title="指数", format=".2f"),
+            ],
+        )
+        .properties(height=300)
+        .interactive()
+    )
+    st.altair_chart(chart, width="stretch")
+    st.caption(
+        f"个股数据日期：{history.as_of or '—'}；沪深300数据日期：{benchmark.as_of or '—'}；"
+        "相对强弱不是买卖信号，也不代表个股未来一定跑赢或跑输。"
+    )
+
+
 def summarize_result(result) -> str:
     if result.score is None:
         return "关键数据不足，当前周期无法形成可靠判断。"
@@ -367,11 +789,11 @@ def show_action_guidance(result) -> None:
         st.markdown(f"**没有持仓：** {new_position}")
         st.markdown(f"**已有持仓：** {existing_position}")
         percent_cols = st.columns(2)
-        percent_cols[0].metric("买入规则支持度", f"{buy_support:.1f}%")
-        percent_cols[1].metric("减仓/卖出规则倾向", f"{sell_tendency:.1f}%")
+        percent_cols[0].metric("买入规则倾向", f"{buy_support:.1f}%")
+        percent_cols[1].metric("卖出规则倾向", f"{sell_tendency:.1f}%")
         st.caption(
-            "百分比计算：买入规则支持度 = 综合评分；减仓/卖出规则倾向 = 100 − 综合评分。"
-            "两者是方向性规则展示，不是上涨/下跌概率、准确率或建议仓位比例。"
+            "计算方式：买入规则倾向 = 综合评分；卖出规则倾向 = 100 − 综合评分。"
+            "这两个数是同一套规则的方向性展示，不是上涨/下跌概率、准确率或建议仓位比例。"
         )
         basis_cols = st.columns(2)
         with basis_cols[0]:
@@ -555,12 +977,213 @@ def show_result(result) -> None:
     st.dataframe(component_frame, width="stretch", hide_index=True)
 
 
-def show_historical_validation(indicators) -> None:
-    st.subheader("历史信号验证")
-    st.caption(
-        "默认验证短线规则：信号日收盘后，下一交易日开盘模拟入场；统计后续第5个和第20个交易日的收盘表现。"
+def format_ratio(value) -> str:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "—"
+    value = float(value)
+    return "∞" if math.isinf(value) else f"{value:.2f}"
+
+
+def show_strategy_result(result) -> None:
+    """Show the optimized strategy before the legacy composite-score results."""
+    with st.container(border=True):
+        st.subheader(f"{result.strategy_name}：{result.signal}")
+        metrics = st.columns(4)
+        metrics[0].metric("策略评分", "—" if result.score is None else f"{result.score:.1f} / 100")
+        metrics[1].metric("信号明确度", f"{result.confidence:.1f}%")
+        metrics[2].metric("趋势/条件通过", f"{result.key_metrics.get('趋势确认数', '—')} / 4")
+        metrics[3].metric("ATR14", format_number(result.key_metrics.get("ATR14")))
+
+        if result.score is None:
+            st.warning("优化策略当前无法判断，缺少有效数据或数据状态不满足要求。", icon=":material/data_alert:")
+        elif result.signal == "买入候选":
+            st.success("优化策略的全部买入过滤条件已通过；这只是研究候选，不代表立即买入。", icon=":material/trending_up:")
+        elif result.signal == "减仓/卖出倾向":
+            st.warning("优化策略偏弱，已有持仓需要重点检查退出条件；没有持仓时不建议新开仓。", icon=":material/trending_down:")
+        else:
+            st.info("优化策略尚未形成完整买入确认，先等待趋势、动量或量价条件改善。", icon=":material/hourglass_top:")
+
+        action_cols = st.columns(2)
+        with action_cols[0]:
+            st.markdown("**没有持仓时**")
+            st.write("可以研究买入候选" if result.signal == "买入候选" else "暂不建议新开仓")
+            st.caption("只有在趋势、动量、量价、风险和评分同时满足时才进入候选区间。")
+        with action_cols[1]:
+            st.markdown("**已有持仓时**")
+            st.write("继续观察持仓" if result.signal != "减仓/卖出倾向" else "检查减仓或退出条件")
+            st.caption("卖出依据以止损、止盈、趋势转弱和最长持有期为准。")
+
+        position_cols = st.columns(2)
+        position_cols[0].metric(
+            "建议新增仓位上限",
+            "25%" if result.signal == "买入候选" else "0%",
+        )
+        position_cols[1].metric(
+            "ATR止损 / 止盈参考",
+            f"{format_number(result.key_metrics.get('止损参考价'))} / {format_number(result.key_metrics.get('止盈参考价'))}",
+        )
+        st.caption("仓位上限和ATR价格只是固定规则的风险控制参考，不是个性化投资建议。")
+
+        reason_cols = st.columns(2)
+        with reason_cols[0]:
+            st.markdown("**为什么买入或未买入**")
+            for condition in result.entry_conditions:
+                st.write(condition)
+        with reason_cols[1]:
+            st.markdown("**为什么卖出或继续持有**")
+            for condition in result.exit_conditions:
+                st.write(condition)
+        st.markdown("**风险控制**")
+        for control in result.risk_controls:
+            st.write(control)
+        for warning in result.warnings:
+            st.warning(warning, icon=":material/warning:")
+
+        component_frame = pd.DataFrame(
+            [
+                {
+                    "策略维度": item.name,
+                    "权重": f"{item.weight:.0%}",
+                    "分数": "—" if item.score is None else item.score,
+                    "实际判断依据": item.detail,
+                }
+                for item in result.components
+            ]
+        )
+        st.dataframe(component_frame, width="stretch", hide_index=True)
+
+
+def show_holding_ratio_guidance(result) -> None:
+    """Show how the current holding ratio changes the fixed strategy action."""
+    with st.container(border=True):
+        st.markdown("**结合已有持仓比例的操作倾向**")
+        st.caption(
+            "请输入这只股票当前占你总资产的比例。应用会把它与当前策略的目标仓位和上限比较；"
+            "建议卖出比例会同时按总资产和当前持仓两种口径显示。"
+        )
+        current_pct = st.number_input(
+            "当前该股持仓比例（占总资产）",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            key="current_holding_ratio_pct",
+        )
+        guidance = recommend_position_action(result, float(current_pct) / 100)
+        st.markdown(f"**结合持仓后的结论：** {guidance.action}")
+
+        if guidance.suggested_buy_ratio is None:
+            st.caption("买入和卖出比例：暂无法计算。数据不足时不生成仓位方向，避免误导。")
+        else:
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("当前持仓比例", f"{guidance.current_ratio:.1%}")
+            metric_cols[1].metric("建议新增仓位", f"{guidance.suggested_buy_ratio:.1%}")
+            metric_cols[2].metric("建议卖出占总资产", f"{guidance.suggested_sell_ratio_total:.1%}")
+            metric_cols[3].metric("建议卖出当前持仓", f"{guidance.suggested_sell_ratio_current:.1%}")
+            st.caption(
+                f"规则目标仓位：{'—' if guidance.target_ratio is None else f'{guidance.target_ratio:.0%}'}；"
+                f"规则最高仓位：{'—' if guidance.max_ratio is None else f'{guidance.max_ratio:.0%}'}。"
+            )
+
+        basis_cols = st.columns(2)
+        with basis_cols[0]:
+            st.markdown("**仓位计算依据**")
+            for basis in guidance.basis:
+                st.write(f"- {basis}")
+        with basis_cols[1]:
+            st.markdown("**使用限制**")
+            for warning in guidance.warnings:
+                st.write(f"- {warning}")
+
+
+def _report_comparison_frame(reports: list[BacktestReport]) -> pd.DataFrame:
+    rows = [
+        ("历史信号数", lambda report: str(report.signal_count)),
+        ("5日毛收益胜率（信号后）", lambda report: format_percent(report.win_rate_5d)),
+        ("20日毛收益胜率（信号后）", lambda report: format_percent(report.win_rate_20d)),
+        ("5日平均毛收益", lambda report: format_percent(report.avg_return_5d)),
+        ("20日平均毛收益", lambda report: format_percent(report.avg_return_20d)),
+        ("实际净收益胜率", lambda report: format_percent(report.win_rate_actual)),
+        ("实际平均净收益", lambda report: format_percent(report.avg_net_return)),
+        ("平均盈利", lambda report: format_percent(report.avg_win_actual)),
+        ("平均亏损", lambda report: format_percent(report.avg_loss_actual)),
+        ("盈亏比", lambda report: format_ratio(report.profit_factor)),
+        ("累计净收益（顺序交易）", lambda report: format_percent(report.total_net_return)),
+        ("单笔20日内最大回撤", lambda report: format_percent(report.max_drawdown_20d)),
+        ("权益曲线最大回撤", lambda report: format_percent(report.max_drawdown_equity)),
+        ("交易成本合计（按100万元资金、25%仓位上限）", lambda report: format_number(report.total_costs)),
+        ("样本外信号数", lambda report: str(report.oos_signal_count)),
+        ("样本外净收益胜率", lambda report: format_percent(report.oos_win_rate)),
+        ("样本外平均净收益", lambda report: format_percent(report.oos_avg_net_return)),
+        ("样本外权益最大回撤", lambda report: format_percent(report.oos_max_drawdown)),
+    ]
+    return pd.DataFrame(
+        [
+            {"指标": label, **{report.strategy_name: formatter(report) for report in reports}}
+            for label, formatter in rows
+        ]
     )
-    report = run_historical_backtest(
+
+
+def show_backtest_records(report: BacktestReport, title: str) -> None:
+    if report.signal_count == 0:
+        st.info(f"{title}暂无可统计信号。", icon=":material/info:")
+        return
+    display_frame = report.signals.rename(
+        columns={
+            "signal_date": "信号日期",
+            "entry_date": "次日入场日期",
+            "score": "策略评分",
+            "entry_price": "入场价格",
+            "shares": "数量",
+            "exit_date": "退出日期",
+            "exit_price": "退出价格",
+            "exit_reason": "退出原因",
+            "holding_days": "持有交易日",
+            "gross_return": "实际毛收益",
+            "net_return": "实际净收益",
+            "return_5d": "信号后5日收益",
+            "return_20d": "信号后20日收益",
+            "max_drawdown_20d": "20日内最大回撤",
+        }
+    ).copy()
+    columns = [
+        "信号日期",
+        "次日入场日期",
+        "策略评分",
+        "入场价格",
+        "数量",
+        "退出日期",
+        "退出价格",
+        "退出原因",
+        "持有交易日",
+        "实际毛收益",
+        "实际净收益",
+        "信号后5日收益",
+        "信号后20日收益",
+        "20日内最大回撤",
+    ]
+    display_frame = display_frame[[column for column in columns if column in display_frame]]
+    if "策略评分" in display_frame:
+        display_frame["策略评分"] = display_frame["策略评分"].map(lambda value: f"{value:.1f}")
+    for column in ("入场价格", "退出价格"):
+        if column in display_frame:
+            display_frame[column] = display_frame[column].map(format_number)
+    for column in ("实际毛收益", "实际净收益", "信号后5日收益", "信号后20日收益", "20日内最大回撤"):
+        if column in display_frame:
+            display_frame[column] = display_frame[column].map(format_percent)
+    if len(display_frame) > 100:
+        st.caption("下表显示最近100个信号，顶部统计使用全部历史信号。")
+        display_frame = display_frame.tail(100)
+    st.dataframe(display_frame, width="stretch", hide_index=True)
+
+
+def show_historical_validation(indicators) -> None:
+    st.subheader("历史验证：原规则 vs 优化策略")
+    st.caption(
+        "两套规则使用同一段真实行情。信号日收盘后，下一交易日开盘入场；5日和20日指标是信号后的固定观察窗口。"
+        "优化策略的实际净收益按止损、止盈、趋势退出或最长持有期回放。"
+    )
+    arguments = (
         indicators.frame,
         indicators.security.code,
         indicators.security.name,
@@ -569,49 +1192,63 @@ def show_historical_validation(indicators) -> None:
         indicators.status,
         indicators.message,
     )
-    if report.message:
-        st.warning(report.message, icon=":material/warning:")
-    if report.signal_count == 0:
-        if not report.message:
-            st.info("当前没有可展示的历史信号统计。", icon=":material/info:")
-        return
-
-    metric_row_one = st.columns(3)
-    metric_row_one[0].metric("历史买入信号数", str(report.signal_count))
-    metric_row_one[1].metric("5日胜率", format_percent(report.win_rate_5d))
-    metric_row_one[2].metric("20日胜率", format_percent(report.win_rate_20d))
-    metric_row_two = st.columns(3)
-    metric_row_two[0].metric("5日平均收益", format_percent(report.avg_return_5d))
-    metric_row_two[1].metric("20日平均收益", format_percent(report.avg_return_20d))
-    metric_row_two[2].metric("20日内最大回撤", format_percent(report.max_drawdown_20d))
-
+    base_report = run_historical_backtest(*arguments)
+    optimized_report = run_optimized_backtest(*arguments)
+    for report in (base_report, optimized_report):
+        if report.message:
+            st.warning(f"{report.strategy_name}：{report.message}", icon=":material/warning:")
+    st.dataframe(
+        _report_comparison_frame([base_report, optimized_report]),
+        width="stretch",
+        hide_index=True,
+    )
+    curve_frames = []
+    for report in (base_report, optimized_report):
+        if report.signal_count == 0 or "exit_date" not in report.signals or "net_return" not in report.signals:
+            continue
+        curve = report.signals[["exit_date", "net_return"]].copy()
+        curve["日期"] = pd.to_datetime(curve["exit_date"], errors="coerce")
+        curve["净收益"] = pd.to_numeric(curve["net_return"], errors="coerce")
+        curve = curve.dropna(subset=["日期", "净收益"]).sort_values("日期")
+        if curve.empty:
+            continue
+        curve["权益指数"] = (1 + curve["净收益"]).cumprod() * 100
+        curve["策略"] = report.strategy_name
+        curve_frames.append(curve[["日期", "权益指数", "策略"]])
+    if curve_frames:
+        st.markdown("**顺序交易权益曲线**")
+        curve_frame = pd.concat(curve_frames, ignore_index=True)
+        curve_chart = (
+            alt.Chart(curve_frame)
+            .mark_line()
+            .encode(
+                x=alt.X("日期:T", title=None),
+                y=alt.Y("权益指数:Q", title="权益指数（初始=100）"),
+                color=alt.Color("策略:N", title=None),
+                tooltip=[
+                    alt.Tooltip("日期:T", title="退出日期", format="%Y-%m-%d"),
+                    alt.Tooltip("策略:N", title="策略"),
+                    alt.Tooltip("权益指数:Q", title="权益指数", format=".2f"),
+                ],
+            )
+            .properties(height=300)
+            .interactive()
+        )
+        st.altair_chart(curve_chart, width="stretch")
+        st.caption("权益曲线按每笔交易退出后的净收益顺序复利计算，不代表可以无摩擦地连续持有。")
     st.warning(
-        "历史统计使用毛收益，未计手续费、滑点、涨跌停和停牌影响；不同信号的观察窗口可能重叠，"
-        "这些指标用于检验规则，不等同于完整资金曲线；历史表现不代表未来收益，也不构成投资建议。",
+        "5日/20日胜率按固定观察窗口的毛收益计算；实际净收益胜率才扣除手续费、卖出印花税和滑点。"
+        "胜率不是上涨概率，也不代表未来收益。"
+        "样本外统计使用历史后30%信号。历史表现不代表未来收益，也不构成投资建议。",
         icon=":material/history:",
     )
-    display_frame = report.signals.rename(
-        columns={
-            "signal_date": "信号日期",
-            "entry_date": "次日入场日期",
-            "score": "规则评分",
-            "entry_price": "入场价格",
-            "return_5d": "5日收益",
-            "return_20d": "20日收益",
-            "max_drawdown_20d": "20日内最大回撤",
-        }
-    ).copy()
-    display_frame["规则评分"] = display_frame["规则评分"].map(lambda value: f"{value:.1f}")
-    display_frame["入场价格"] = display_frame["入场价格"].map(format_number)
-    for column in ("5日收益", "20日收益", "20日内最大回撤"):
-        display_frame[column] = display_frame[column].map(format_percent)
-    if len(display_frame) > 100:
-        st.caption("下表显示最近100个信号，顶部统计使用全部历史信号。")
-        display_frame = display_frame.tail(100)
-    st.dataframe(display_frame, width="stretch", hide_index=True)
+    with st.expander("查看优化策略交易明细"):
+        show_backtest_records(optimized_report, "优化策略")
+    with st.expander("查看原综合评分交易明细"):
+        show_backtest_records(base_report, "基础规则")
 
 
-def build_analysis_report_html(security, history, indicators, financials, results) -> str:
+def build_analysis_report_html(security, history, indicators, financials, results, strategy_result=None) -> str:
     latest = indicators.latest
     summary_rows = "".join(
         "<tr>"
@@ -632,6 +1269,16 @@ def build_analysis_report_html(security, history, indicators, financials, result
         for result in results.values()
         for warning in result.warnings
     ) or "<li>当前没有风险警告</li>"
+    strategy_summary = ""
+    if strategy_result is not None:
+        strategy_summary = (
+            f"<h2>{escape(strategy_result.strategy_name)}</h2>"
+            f"<p>信号：{escape(strategy_result.signal)}；评分："
+            f"{'—' if strategy_result.score is None else f'{strategy_result.score:.1f}'}；"
+            f"信号明确度：{strategy_result.confidence:.1f}%</p>"
+            f"<h3>买入条件</h3><ul>{''.join(f'<li>{escape(item)}</li>' for item in strategy_result.entry_conditions) or '<li>暂无</li>'}</ul>"
+            f"<h3>卖出与风控条件</h3><ul>{''.join(f'<li>{escape(item)}</li>' for item in strategy_result.exit_conditions + strategy_result.risk_controls) or '<li>暂无</li>'}</ul>"
+        )
     financial_rows = "".join(
         f"<tr><td>{escape(label)}</td><td>{escape(str(financials.get(key, '—')))}</td></tr>"
         for key, label in {
@@ -659,6 +1306,7 @@ th {{ background: #f5f7fa; }} .notice {{ background: #fff8e1; padding: 12px; bor
 <div class="meta">数据源：{escape(str(history.source))}　数据日期：{escape(str(history.as_of or '—'))}　最新收盘价：{escape(format_number(latest.get('close')))}</div>
 <h2>三周期信号</h2>
 <table><thead><tr><th>周期</th><th>信号</th><th>评分</th><th>信号明确度</th></tr></thead><tbody>{summary_rows}</tbody></table>
+{strategy_summary}
 <h2>主要分析依据</h2><ul>{reasons or '<li>当前没有可用分析依据</li>'}</ul>
 <h2>风险与数据警告</h2><ul>{warnings}</ul>
 <h2>财务与估值</h2><table><thead><tr><th>指标</th><th>数值</th></tr></thead><tbody>{financial_rows}</tbody></table>
@@ -666,7 +1314,7 @@ th {{ background: #f5f7fa; }} .notice {{ background: #fff8e1; padding: 12px; bor
 </body></html>"""
 
 
-def build_analysis_svg(security, history, indicators, results) -> str:
+def build_analysis_svg(security, history, indicators, results, strategy_result=None) -> str:
     latest = indicators.latest
     lines = [
         f"{security.name}（{security.code}）",
@@ -677,6 +1325,9 @@ def build_analysis_svg(security, history, indicators, results) -> str:
     for result in results.values():
         score = "—" if result.score is None else f"{result.score:.1f}分"
         lines.append(f"{result.horizon}：{result.signal}    {score}    明确度 {result.confidence:.1f}%")
+    if strategy_result is not None:
+        score = "—" if strategy_result.score is None else f"{strategy_result.score:.1f}分"
+        lines.append(f"优化策略：{strategy_result.signal}    {score}    明确度 {strategy_result.confidence:.1f}%")
     lines.extend(["", "本图仅供研究参考，不构成投资建议。"])
     text_rows = ""
     for index, line in enumerate(lines):
@@ -691,12 +1342,12 @@ def build_analysis_svg(security, history, indicators, results) -> str:
 </svg>"""
 
 
-def show_share_and_export(security, history, indicators, financials, results) -> None:
+def show_share_and_export(security, history, indicators, financials, results, strategy_result=None) -> None:
     with st.popover("分享与导出", icon=":material/share:"):
         st.caption("分享链接会打开该股票的分析页面。")
         st.code(build_share_url(security.code), language=None)
-        report_html = build_analysis_report_html(security, history, indicators, financials, results)
-        report_svg = build_analysis_svg(security, history, indicators, results)
+        report_html = build_analysis_report_html(security, history, indicators, financials, results, strategy_result)
+        report_svg = build_analysis_svg(security, history, indicators, results, strategy_result)
         st.download_button(
             "下载分析图（SVG）",
             data=report_svg,
@@ -733,6 +1384,48 @@ def show_data_freshness(history) -> None:
         )
     else:
         st.caption(f"数据更新时间：{history.as_of}（最近交易日收盘数据）")
+
+
+def show_data_quality_center(history, indicators, financials) -> None:
+    """Make the data pipeline auditable before showing a trading conclusion."""
+    report = assess_data_quality(history, indicators, financials)
+    with st.container(border=True):
+        st.subheader("数据可信度中心")
+        st.caption(
+            "这是对数据来源、时效、字段和指标完整性的检查，不是对股票上涨概率的预测。"
+        )
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("数据可信度", report.level)
+        metric_cols[1].metric("质量评分", f"{report.score:.0f} / 100")
+        metric_cols[2].metric("行情日期", str(report.as_of or "—"))
+        metric_cols[3].metric("有效日线", f"{report.row_count} 条")
+
+        check_frame = pd.DataFrame(
+            [
+                {"检查项目": item.name, "状态": item.status, "检查结果": item.detail}
+                for item in report.checks
+            ]
+        )
+        st.dataframe(check_frame, width="stretch", hide_index=True)
+        if report.actionable:
+            st.success(
+                "行情来源、时效、价格字段和核心技术指标通过基本检查；"
+                "财务数据仍需结合报告期和同行业比较。",
+                icon=":material/verified:",
+            )
+        else:
+            st.error(
+                "当前数据不满足直接解读买卖方向的最低条件，页面中的方向性结论应视为不可判断。",
+                icon=":material/block:",
+            )
+        if report.financial_coverage < 1:
+            st.info(
+                f"财务与估值字段覆盖率为 {report.financial_coverage:.0%}。"
+                "短线技术分析可以独立计算，但波段和中长期结论会因财务字段缺失而受限。",
+                icon=":material/account_balance:",
+            )
+        for warning in report.warnings:
+            st.warning(warning, icon=":material/warning:")
 
 
 def show_personal_tools_sidebar() -> None:
@@ -791,7 +1484,10 @@ def show_personal_tools_sidebar() -> None:
             st.caption("重新查询同一股票时，与本次会话上一次记录比较。")
 
     if watchlist or recent:
-        st.caption("自选股、最近查询和提醒记录仅保存在当前浏览器会话。")
+        if _is_local_runtime():
+            st.caption("本地模式：自选股、最近查询、提醒快照和模拟交易保存在 data/stock_analysis.db。")
+        else:
+            st.caption("公开部署：当前数据按浏览器会话隔离；多人长期保存需要登录和外部数据库。")
 
 
 def show_portfolio(service: PaperTradingService, symbol: str | None = None, price: float | None = None) -> None:
@@ -878,6 +1574,7 @@ def main() -> None:
     analyze = submitted or auto_analyze
     st.caption("支持6位股票代码、带交易所前缀的代码或股票名称；公开数据异常时不会生成买卖信号。")
     show_scoring_guide()
+    show_strategy_guide()
 
     request_key = query.strip()
     if st.session_state.get("analysis_key") != request_key:
@@ -914,6 +1611,7 @@ def main() -> None:
         return
 
     security, history, indicators, financials, results = st.session_state.analysis
+    strategy_result = evaluate_strategy(indicators, DEFAULT_STRATEGY)
     st.header(f"{security.name}（{security.code}）")
     freshness = "正常" if history.status == "ok" else "缓存/需检查"
     source_label = SOURCE_LABELS.get(history.source, history.source)
@@ -922,6 +1620,7 @@ def main() -> None:
         f"数据源：{source_label}　数据状态：{freshness}"
     )
     show_data_freshness(history)
+    show_data_quality_center(history, indicators, financials)
     if history.message:
         st.info(history.message)
     for alert in st.session_state.get("analysis_alerts", []):
@@ -937,6 +1636,7 @@ def main() -> None:
         ):
             if is_watched:
                 watchlist.pop(security.symbol, None)
+                get_store().delete_watchlist_item(get_paper_account_id(), security.symbol)
                 st.toast("已移出自选股")
             else:
                 watchlist[security.symbol] = {
@@ -944,10 +1644,12 @@ def main() -> None:
                     "code": security.code,
                     "name": security.name,
                     "exchange": security.exchange,
+                    "market_status": security.market_status,
                 }
+                get_store().save_watchlist_item(get_paper_account_id(), security)
                 st.toast("已加入自选股")
             st.rerun()
-        show_share_and_export(security, history, indicators, financials, results)
+        show_share_and_export(security, history, indicators, financials, results, strategy_result)
     latest = indicators.latest
     cols = st.columns(4)
     cols[0].metric("最新收盘价", format_number(latest.get("close")))
@@ -956,24 +1658,32 @@ def main() -> None:
     cols[3].metric("MACD柱", format_number(latest.get("macd_hist"), 4))
 
     tabs = st.tabs(
-        ["综合结论", "行情与指标", "财务与估值", "模拟交易", "历史验证"],
+        ["综合结论", "行情与指标", "资金流向", "财务与估值", "模拟交易", "历史验证"],
         on_change="rerun",
     )
     if tabs[0].open:
         with tabs[0]:
-            show_horizon_overview(results)
-            for key in ("short", "swing", "long"):
-                show_result(results[key])
-                if key != "long":
-                    st.divider()
+            show_strategy_result(strategy_result)
+            show_holding_ratio_guidance(strategy_result)
+            with st.expander("原综合评分对照", expanded=False):
+                show_horizon_overview(results)
+                for key in ("short", "swing", "long"):
+                    show_result(results[key])
+                    if key != "long":
+                        st.divider()
 
     if tabs[1].open:
         with tabs[1]:
             st.altair_chart(build_price_chart(indicators.frame), width="stretch")
+            show_market_comparison(security, history)
             st.dataframe(indicators.frame.tail(30), width="stretch", hide_index=True)
 
     if tabs[2].open:
         with tabs[2]:
+            show_money_flow(security)
+
+    if tabs[3].open:
+        with tabs[3]:
             labels = {"pe": "PE", "pb": "PB", "roe": "ROE（%）", "revenue_growth": "营收增速（%）", "profit_growth": "利润增速（%）", "debt_ratio": "资产负债率（%）"}
             financial_frame = pd.DataFrame(
                 [{"指标": label, "数值": format_financial_value(key, financials.get(key))} for key, label in labels.items()]
@@ -981,8 +1691,8 @@ def main() -> None:
             st.dataframe(financial_frame, width="stretch", hide_index=True)
             show_financial_metric_guide(financials)
 
-    if tabs[3].open:
-        with tabs[3]:
+    if tabs[4].open:
+        with tabs[4]:
             store = get_store()
             paper = PaperTradingService(store)
             account_id = get_paper_account_id()
@@ -1009,8 +1719,8 @@ def main() -> None:
                     st.error(str(exc))
             show_portfolio(paper, security.symbol, float(latest["close"]))
 
-    if tabs[4].open:
-        with tabs[4]:
+    if tabs[5].open:
+        with tabs[5]:
             show_historical_validation(indicators)
 
 

@@ -35,6 +35,23 @@ class PriceHistory:
 
 
 @dataclass
+class MoneyFlowHistory:
+    """Daily provider-estimated main-money flow history."""
+
+    security: Security
+    data: pd.DataFrame
+    source: str
+    status: str = "ok"
+    message: str = ""
+
+    @property
+    def as_of(self) -> date | None:
+        if self.data.empty or "date" not in self.data.columns:
+            return None
+        return pd.Timestamp(self.data["date"].max()).date()
+
+
+@dataclass
 class IndicatorSnapshot:
     security: Security
     frame: pd.DataFrame
@@ -71,6 +88,54 @@ class AnalysisResult:
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     key_metrics: dict[str, Any] = field(default_factory=dict)
+    strategy_name: str = "基础综合评分"
+    entry_conditions: list[str] = field(default_factory=list)
+    exit_conditions: list[str] = field(default_factory=list)
+    risk_controls: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    """Transparent defaults for the 5-20 trading-day swing strategy."""
+
+    name: str = "趋势动量波段策略"
+    score_threshold: float = 70.0
+    rsi_min: float = 45.0
+    rsi_max: float = 72.0
+    min_volume_ratio: float = 1.0
+    max_volatility: float = 0.60
+    max_drawdown: float = -0.30
+    stop_atr_multiple: float = 1.50
+    target_atr_multiple: float = 2.25
+    max_holding_days: int = 20
+    cooldown_days: int = 5
+    capital_per_trade: float = 1_000_000.0
+    risk_per_trade: float = 0.01
+    max_position_ratio: float = 0.25
+    commission_rate: float = 0.0003
+    minimum_commission: float = 5.0
+    stamp_tax_rate: float = 0.001
+    slippage_rate: float = 0.001
+    lot_size: int = 100
+
+
+@dataclass
+class StrategyEvaluation:
+    """Auditable output from the optimized strategy, separate from base scoring."""
+
+    strategy_name: str
+    as_of: date | None
+    data_status: str
+    score: float | None
+    signal: str
+    confidence: float
+    components: list[ScoreComponent] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    key_metrics: dict[str, Any] = field(default_factory=dict)
+    entry_conditions: list[str] = field(default_factory=list)
+    exit_conditions: list[str] = field(default_factory=list)
+    risk_controls: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -105,4 +170,3 @@ class PortfolioSnapshot:
     total_market_value: float
     total_equity: float
     realized_pnl: float
-

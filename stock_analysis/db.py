@@ -44,6 +44,24 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_price_bars_symbol_date
                     ON price_bars(symbol, date);
 
+                CREATE TABLE IF NOT EXISTS money_flow_bars (
+                    symbol TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'unknown',
+                    main_net_inflow REAL NOT NULL,
+                    main_net_ratio REAL,
+                    close REAL,
+                    price_change REAL,
+                    super_large_net_inflow REAL,
+                    large_net_inflow REAL,
+                    medium_net_inflow REAL,
+                    small_net_inflow REAL,
+                    PRIMARY KEY (symbol, date, source)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_money_flow_symbol_date
+                    ON money_flow_bars(symbol, date);
+
                 CREATE TABLE IF NOT EXISTS security_cache (
                     code TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -87,6 +105,39 @@ class SQLiteStore:
                     traded_at TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'filled',
                     message TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS user_watchlist (
+                    account_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    market_status TEXT NOT NULL DEFAULT 'normal',
+                    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (account_id, symbol)
+                );
+
+                CREATE TABLE IF NOT EXISTS recent_queries (
+                    account_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    market_status TEXT NOT NULL DEFAULT 'normal',
+                    as_of TEXT,
+                    last_queried_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (account_id, symbol)
+                );
+
+                CREATE TABLE IF NOT EXISTS analysis_snapshots (
+                    account_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    price REAL,
+                    score REAL,
+                    as_of TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (account_id, symbol)
                 );
                 """
             )
@@ -177,6 +228,246 @@ class SQLiteStore:
                 )
             connection.execute("DROP TABLE financial_cache")
             connection.execute("ALTER TABLE financial_cache_new RENAME TO financial_cache")
+
+    def migrate_account(self, old_account_id: str, new_account_id: str) -> bool:
+        """Copy an old session account into a stable account without deleting the source."""
+        if not old_account_id or not new_account_id or old_account_id == new_account_id:
+            return False
+        with self._connect() as connection:
+            old_account = connection.execute(
+                "SELECT cash FROM paper_accounts WHERE account_id = ?",
+                (old_account_id,),
+            ).fetchone()
+            new_account = connection.execute(
+                """
+                SELECT cash,
+                       (SELECT COUNT(*)
+                        FROM paper_orders
+                        WHERE paper_orders.account_id = paper_accounts.account_id) AS order_count
+                FROM paper_accounts
+                WHERE account_id = ?
+                """,
+                (new_account_id,),
+            ).fetchone()
+            if old_account is None:
+                return False
+            if new_account is not None and (
+                int(new_account["order_count"]) > 0
+                or abs(float(new_account["cash"]) - 1_000_000.0) > 1e-8
+            ):
+                return False
+
+            if new_account is None:
+                connection.execute(
+                    "INSERT INTO paper_accounts(account_id, cash) VALUES (?, ?)",
+                    (new_account_id, float(old_account["cash"])),
+                )
+            else:
+                connection.execute(
+                    "UPDATE paper_accounts SET cash = ? WHERE account_id = ?",
+                    (float(old_account["cash"]), new_account_id),
+                )
+            connection.execute(
+                """
+                INSERT INTO paper_orders(
+                    account_id, symbol, side, shares, price, fee,
+                    traded_at, status, message
+                )
+                SELECT ?, symbol, side, shares, price, fee,
+                       traded_at, status, message
+                FROM paper_orders
+                WHERE account_id = ?
+                """,
+                (new_account_id, old_account_id),
+            )
+            return True
+
+    def migrate_latest_session_account(self, new_account_id: str) -> bool:
+        """Migrate the most recently active legacy random account for local use."""
+        with self._connect() as connection:
+            new_account = connection.execute(
+                """
+                SELECT cash,
+                       (SELECT COUNT(*)
+                        FROM paper_orders
+                        WHERE paper_orders.account_id = paper_accounts.account_id) AS order_count
+                FROM paper_accounts
+                WHERE account_id = ?
+                """,
+                (new_account_id,),
+            ).fetchone()
+            if new_account is not None and (
+                int(new_account["order_count"]) > 0
+                or abs(float(new_account["cash"]) - 1_000_000.0) > 1e-8
+            ):
+                return False
+            legacy = connection.execute(
+                """
+                SELECT account_id
+                FROM paper_accounts
+                WHERE account_id LIKE 'session-%'
+                ORDER BY
+                    CASE WHEN EXISTS (
+                        SELECT 1
+                        FROM paper_orders
+                        WHERE paper_orders.account_id = paper_accounts.account_id
+                    ) THEN 0 ELSE 1 END,
+                    COALESCE(
+                        (SELECT MAX(id)
+                         FROM paper_orders
+                         WHERE paper_orders.account_id = paper_accounts.account_id),
+                        -1
+                    ) DESC,
+                    created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if legacy is None:
+            return False
+        return self.migrate_account(legacy["account_id"], new_account_id)
+
+    @staticmethod
+    def _date_string(value: date | str | None) -> str | None:
+        if value is None or str(value).strip() in {"", "—", "None"}:
+            return None
+        try:
+            return pd.Timestamp(value).strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            return None
+
+    def save_watchlist_item(self, account_id: str, security: Security) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_watchlist(
+                    account_id, symbol, code, name, exchange, market_status, added_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(account_id, symbol) DO UPDATE SET
+                    code=excluded.code, name=excluded.name,
+                    exchange=excluded.exchange, market_status=excluded.market_status
+                """,
+                (
+                    account_id,
+                    security.symbol,
+                    security.code,
+                    security.name,
+                    security.exchange,
+                    security.market_status,
+                ),
+            )
+
+    def delete_watchlist_item(self, account_id: str, symbol: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM user_watchlist WHERE account_id = ? AND symbol = ?",
+                (account_id, symbol),
+            )
+
+    def load_watchlist(self, account_id: str) -> list[Security]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT code, name, exchange, market_status
+                FROM user_watchlist
+                WHERE account_id = ?
+                ORDER BY added_at DESC, symbol
+                """,
+                (account_id,),
+            ).fetchall()
+        return [Security(**dict(row)) for row in rows]
+
+    def save_recent_query(
+        self, account_id: str, security: Security, as_of: date | str | None = None
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO recent_queries(
+                    account_id, symbol, code, name, exchange, market_status,
+                    as_of, last_queried_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(account_id, symbol) DO UPDATE SET
+                    code=excluded.code, name=excluded.name,
+                    exchange=excluded.exchange, market_status=excluded.market_status,
+                    as_of=excluded.as_of, last_queried_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    account_id,
+                    security.symbol,
+                    security.code,
+                    security.name,
+                    security.exchange,
+                    security.market_status,
+                    self._date_string(as_of),
+                ),
+            )
+
+    def load_recent_queries(self, account_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 100))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT symbol, code, name, exchange, market_status, as_of
+                FROM recent_queries
+                WHERE account_id = ?
+                ORDER BY last_queried_at DESC, symbol
+                LIMIT ?
+                """,
+                (account_id, safe_limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return None if pd.isna(number) else number
+
+    def save_analysis_snapshot(
+        self,
+        account_id: str,
+        symbol: str,
+        price: Any,
+        score: Any,
+        as_of: date | str | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO analysis_snapshots(
+                    account_id, symbol, price, score, as_of, updated_at
+                ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(account_id, symbol) DO UPDATE SET
+                    price=excluded.price, score=excluded.score,
+                    as_of=excluded.as_of, updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    account_id,
+                    symbol,
+                    self._optional_float(price),
+                    self._optional_float(score),
+                    self._date_string(as_of),
+                ),
+            )
+
+    def load_analysis_snapshots(
+        self, account_id: str, limit: int = 30
+    ) -> dict[str, dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 100))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT symbol, price, score, as_of
+                FROM analysis_snapshots
+                WHERE account_id = ?
+                ORDER BY updated_at DESC, symbol
+                LIMIT ?
+                """,
+                (account_id, safe_limit),
+            ).fetchall()
+        return {row["symbol"]: dict(row) for row in reversed(rows)}
 
     def upsert_securities(self, securities: Iterable[Security]) -> None:
         rows = [
@@ -357,6 +648,93 @@ class SQLiteStore:
                 f"""
                 SELECT date, open, high, low, close, volume, amount
                 FROM price_bars
+                WHERE symbol = ? AND date BETWEEN ? AND ?
+                {source_clause}
+                ORDER BY date
+                """,
+                connection,
+                params=params,
+                parse_dates=["date"],
+            )
+
+    def upsert_money_flow(
+        self, symbol: str, frame: pd.DataFrame, source: str = "unknown"
+    ) -> None:
+        if frame.empty:
+            return
+        required = {"date", "main_net_inflow"}
+        missing = required.difference(frame.columns)
+        if missing:
+            raise ValueError(f"主力资金数据缺少字段: {', '.join(sorted(missing))}")
+
+        def optional_float(value: Any) -> float | None:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            return None if pd.isna(number) else number
+
+        rows = []
+        for row in frame.itertuples(index=False):
+            record = row._asdict()
+            rows.append(
+                (
+                    symbol,
+                    pd.Timestamp(record["date"]).strftime("%Y-%m-%d"),
+                    source,
+                    optional_float(record.get("main_net_inflow")),
+                    optional_float(record.get("main_net_ratio")),
+                    optional_float(record.get("close")),
+                    optional_float(record.get("change")),
+                    optional_float(record.get("super_large_net_inflow")),
+                    optional_float(record.get("large_net_inflow")),
+                    optional_float(record.get("medium_net_inflow")),
+                    optional_float(record.get("small_net_inflow")),
+                )
+            )
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO money_flow_bars(
+                    symbol, date, source, main_net_inflow, main_net_ratio, close,
+                    price_change, super_large_net_inflow, large_net_inflow,
+                    medium_net_inflow, small_net_inflow
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, date, source) DO UPDATE SET
+                    main_net_inflow=excluded.main_net_inflow,
+                    main_net_ratio=excluded.main_net_ratio, close=excluded.close,
+                    price_change=excluded.price_change,
+                    super_large_net_inflow=excluded.super_large_net_inflow,
+                    large_net_inflow=excluded.large_net_inflow,
+                    medium_net_inflow=excluded.medium_net_inflow,
+                    small_net_inflow=excluded.small_net_inflow
+                """,
+                rows,
+            )
+
+    def load_money_flow(
+        self,
+        symbol: str,
+        start_date: date | str,
+        end_date: date | str,
+        sources: tuple[str, ...] | None = None,
+    ) -> pd.DataFrame:
+        start = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+        end = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+        source_clause = ""
+        params: list[Any] = [symbol, start, end]
+        if sources:
+            placeholders = ", ".join("?" for _ in sources)
+            source_clause = f" AND source IN ({placeholders})"
+            params.extend(sources)
+        with self._connect() as connection:
+            return pd.read_sql_query(
+                f"""
+                SELECT date, main_net_inflow, main_net_ratio, close,
+                       price_change AS change, super_large_net_inflow,
+                       large_net_inflow, medium_net_inflow, small_net_inflow
+                FROM money_flow_bars
                 WHERE symbol = ? AND date BETWEEN ? AND ?
                 {source_clause}
                 ORDER BY date
