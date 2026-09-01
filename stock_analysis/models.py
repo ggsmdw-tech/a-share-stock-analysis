@@ -170,3 +170,45 @@ class PortfolioSnapshot:
     total_market_value: float
     total_equity: float
     realized_pnl: float
+
+
+@dataclass
+class TradePlan:
+    """A user's pre-trade plan, persisted for later review."""
+
+    id: int | None
+    account_id: str
+    symbol: str
+    direction: str
+    setup: str
+    horizon: str
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    total_capital: float
+    risk_pct: float
+    max_position_pct: float
+    planned_shares: int
+    planned_amount: float
+    risk_budget: float
+    estimated_max_loss: float
+    risk_reward: float | None
+    thesis: str
+    invalidation: str
+    status: str = "planned"
+    created_at: str | None = None
+
+
+@dataclass
+class TradeReview:
+    """A structured post-trade review."""
+
+    id: int | None
+    account_id: str
+    symbol: str
+    plan_id: int | None
+    review_date: str
+    outcome: str
+    execution_adherence: int
+    mistake_tags: tuple[str, ...] = field(default_factory=tuple)
+    notes: str = ""

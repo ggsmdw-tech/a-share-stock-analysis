@@ -5,25 +5,41 @@ from html import escape
 import math
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-import uuid
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 import altair as alt
 
 from stock_analysis.backtest import BacktestReport, backtest_buy_signals, backtest_strategy
+from stock_analysis.auth import (
+    active_supabase_client,
+    current_user_email,
+    ensure_authenticated,
+    get_supabase_config,
+    logout,
+)
+from stock_analysis.cloud_store import HybridStore, SupabaseStore
 from stock_analysis.data import StockDataService, create_provider
 from stock_analysis.db import SQLiteStore
 from stock_analysis.indicators import calculate_indicators
-from stock_analysis.models import IndicatorSnapshot, MoneyFlowHistory, PriceHistory, Security
+from stock_analysis.models import (
+    IndicatorSnapshot,
+    MoneyFlowHistory,
+    PriceHistory,
+    Security,
+    TradePlan,
+    TradeReview,
+)
 from stock_analysis.paper import PaperTradingService
 from stock_analysis.position import recommend_position_action
 from stock_analysis.quality import assess_data_quality
 from stock_analysis.scoring import evaluate_all_horizons
 from stock_analysis.strategy import DEFAULT_STRATEGY, evaluate_strategy
+from stock_analysis.trading_plan import calculate_position_size
 
 
-APP_VERSION = "v0.02 数据可信度版"
+APP_VERSION = "v0.04 多用户云端持久化版"
 LOCAL_ACCOUNT_ID = "local-default"
 
 st.set_page_config(page_title=f"A股智能分析 · {APP_VERSION}", page_icon="📈", layout="wide")
@@ -82,8 +98,35 @@ FINANCIAL_METRIC_GUIDE = (
 
 
 @st.cache_resource
-def get_store() -> SQLiteStore:
+def get_cache_store() -> SQLiteStore:
     return SQLiteStore(PROJECT_ROOT / "data" / "stock_analysis.db")
+
+
+def get_store() -> Any:
+    """Return local SQLite in development and user-scoped Supabase online."""
+    if _is_local_runtime():
+        return get_cache_store()
+    config = get_supabase_config()
+    if config is None:
+        raise RuntimeError("线上模式尚未配置 Supabase。")
+    return HybridStore(
+        get_cache_store(),
+        SupabaseStore(active_supabase_client(), get_paper_account_id()),
+    )
+
+
+def cloud_persistence_error_message(exc: Exception) -> str:
+    """Translate common deployment mistakes into an actionable Chinese message."""
+    message = str(exc).lower()
+    if (
+        "relation" in message and "does not exist" in message
+    ) or "pgrst205" in message:
+        return "云端数据库尚未初始化，请管理员在 Supabase SQL Editor 执行 supabase/schema.sql。"
+    if "row-level security" in message or "permission denied" in message:
+        return "云端数据库权限配置不完整，请检查各用户表的 RLS 策略和登录状态。"
+    if "jwt" in message or "not authenticated" in message:
+        return "登录状态已失效，请退出后重新登录。"
+    return "云端个人数据服务暂时不可用，请稍后重试；若持续出现，请检查 Supabase 配置。"
 
 
 def initialize_session_state() -> None:
@@ -99,7 +142,7 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("analysis_query", shared_symbol or "600519")
     st.session_state.setdefault("auto_analyze", bool(shared_symbol))
     if st.session_state.get("_persistence_loaded_account") != account_id:
-        if previous_account_id and previous_account_id != account_id:
+        if previous_account_id and previous_account_id != account_id and _is_local_runtime():
             if isinstance(previous_watchlist, dict):
                 for item in previous_watchlist.values():
                     try:
@@ -140,6 +183,9 @@ def initialize_session_state() -> None:
                         item.get("score"),
                         item.get("as_of"),
                     )
+        elif previous_account_id and previous_account_id != account_id:
+            for key in ("analysis", "analysis_error", "analysis_key", "analysis_alerts"):
+                st.session_state.pop(key, None)
 
         loaded_watchlist = store.load_watchlist(account_id)
         st.session_state["watchlist"] = {
@@ -156,6 +202,20 @@ def initialize_session_state() -> None:
         st.session_state["analysis_snapshots"] = store.load_analysis_snapshots(
             account_id, limit=30
         )
+        alert_settings = store.load_alert_settings(account_id)
+        if alert_settings:
+            st.session_state["alerts_enabled"] = bool(alert_settings.get("enabled", True))
+            st.session_state["price_alert_threshold"] = float(
+                alert_settings.get("price_threshold", 3.0)
+            )
+            st.session_state["score_alert_threshold"] = float(
+                alert_settings.get("score_threshold", 5.0)
+            )
+        else:
+            st.session_state["alerts_enabled"] = True
+            st.session_state["price_alert_threshold"] = 3.0
+            st.session_state["score_alert_threshold"] = 5.0
+        st.session_state["_saved_alert_settings"] = None
         st.session_state["_persistence_loaded_account"] = account_id
         if not shared_symbol and not previous_account_id and st.session_state["recent_queries"]:
             st.session_state["analysis_query"] = st.session_state["recent_queries"][0]["code"]
@@ -557,14 +617,18 @@ def _is_local_runtime() -> bool:
 
 
 def get_paper_account_id() -> str:
-    """Use a stable local account while isolating users on public deployments."""
+    """Use the local account or the authenticated Supabase user UUID."""
     previous_account_id = st.session_state.get("paper_account_id")
     if _is_local_runtime():
         if previous_account_id and previous_account_id != LOCAL_ACCOUNT_ID:
-            get_store().migrate_account(previous_account_id, LOCAL_ACCOUNT_ID)
+            get_cache_store().migrate_account(previous_account_id, LOCAL_ACCOUNT_ID)
         st.session_state["paper_account_id"] = LOCAL_ACCOUNT_ID
         return LOCAL_ACCOUNT_ID
-    return st.session_state.setdefault("paper_account_id", f"session-{uuid.uuid4().hex}")
+    user_id = str(st.session_state.get("auth_user_id", "")).strip()
+    if not user_id:
+        raise RuntimeError("Online user is not authenticated.")
+    st.session_state["paper_account_id"] = user_id
+    return user_id
 
 
 def build_price_chart(frame: pd.DataFrame) -> alt.Chart:
@@ -1095,6 +1159,214 @@ def show_holding_ratio_guidance(result) -> None:
                 st.write(f"- {warning}")
 
 
+def show_trade_plan(security: Security, strategy_result, latest: dict) -> None:
+    """Collect a pre-trade plan and calculate a conservative position size."""
+    current_price = latest.get("close")
+    try:
+        current_price = float(current_price)
+    except (TypeError, ValueError):
+        current_price = 0.0
+    if current_price <= 0:
+        return
+
+    stop_default = strategy_result.key_metrics.get("止损参考价") or current_price * 0.95
+    target_default = strategy_result.key_metrics.get("止盈参考价") or current_price * 1.10
+    if stop_default >= current_price:
+        stop_default = current_price * 0.95
+    if target_default <= current_price:
+        target_default = current_price * 1.10
+    default_direction = "买入计划" if strategy_result.signal == "买入候选" else "观察计划"
+    default_thesis = (
+        f"{strategy_result.strategy_name}：{strategy_result.signal}，评分"
+        f"{strategy_result.score:.1f}分。"
+        if strategy_result.score is not None
+        else "当前数据不足，先记录观察计划。"
+    )
+
+    with st.container(border=True):
+        st.markdown("**交易计划卡（先计划，再下单）**")
+        st.caption(
+            "这张卡不预测收益，也不会自动下单。它要求你先写清买入理由、止损位置和最大风险，"
+            "再决定是否创建模拟订单。"
+        )
+        failed_conditions = [
+            condition for condition in strategy_result.entry_conditions
+            if condition.startswith("未通过")
+        ]
+        if failed_conditions:
+            st.warning(
+                "当前不满足新开仓条件，主要拦截项：" + "；".join(failed_conditions),
+                icon=":material/block:",
+            )
+        elif strategy_result.signal == "买入候选":
+            st.success("当前策略条件全部通过，但仍需按交易计划控制仓位和最大亏损。", icon=":material/check_circle:")
+
+        with st.form(f"trade_plan_{security.symbol}", border=False):
+            first = st.columns(3)
+            direction = first[0].selectbox(
+                "计划类型", ["买入计划", "观察计划"],
+                index=["买入计划", "观察计划"].index(default_direction),
+            )
+            setup = first[1].selectbox("交易场景", ["趋势突破", "回踩确认", "估值观察", "其他"])
+            horizon = first[2].selectbox("计划周期", ["5–20个交易日", "1–3个月", "长期观察"])
+
+            prices = st.columns(3)
+            entry_price = prices[0].number_input(
+                "计划买入价", min_value=0.01, value=round(current_price, 2), step=0.01,
+                key=f"plan_entry_{security.symbol}",
+            )
+            stop_loss = prices[1].number_input(
+                "止损价", min_value=0.01, value=round(float(stop_default), 2), step=0.01,
+                key=f"plan_stop_{security.symbol}",
+            )
+            take_profit = prices[2].number_input(
+                "止盈价", min_value=0.01, value=round(float(target_default), 2), step=0.01,
+                key=f"plan_target_{security.symbol}",
+            )
+
+            capital_cols = st.columns(3)
+            total_capital = capital_cols[0].number_input(
+                "计划总资金（元）", min_value=100.0, value=100_000.0, step=10_000.0,
+                key=f"plan_capital_{security.symbol}",
+            )
+            risk_pct = capital_cols[1].number_input(
+                "单笔最多亏损（%）", min_value=0.1, max_value=10.0, value=1.0, step=0.1,
+                key=f"plan_risk_{security.symbol}",
+            )
+            max_position_pct = capital_cols[2].number_input(
+                "单只股票仓位上限（%）", min_value=1.0, max_value=100.0, value=25.0, step=1.0,
+                key=f"plan_max_position_{security.symbol}",
+            )
+
+            thesis = st.text_area(
+                "我的买入/观察理由",
+                value=default_thesis,
+                key=f"plan_thesis_{security.symbol}",
+            )
+            invalidation = st.text_area(
+                "什么情况说明判断错误？",
+                value="收盘跌破止损价，或趋势跌破20日均线且MACD柱转负。",
+                key=f"plan_invalidation_{security.symbol}",
+            )
+            save_plan = st.form_submit_button(
+                "计算并保存交易计划", type="primary", icon=":material/save:"
+            )
+
+        sizing = calculate_position_size(
+            float(entry_price), float(stop_loss), float(take_profit), float(total_capital),
+            float(risk_pct) / 100, float(max_position_pct) / 100,
+        )
+        st.markdown("**仓位与风险估算**")
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("风险预算", f"¥{sizing.risk_budget:,.0f}")
+        metric_cols[1].metric("建议股数", f"{sizing.suggested_shares:,} 股")
+        metric_cols[2].metric("计划投入", f"¥{sizing.planned_amount:,.0f}")
+        metric_cols[3].metric("预计最大亏损", f"¥{sizing.estimated_max_loss:,.0f}")
+        metric_cols[4].metric("预期盈亏比", "—" if sizing.risk_reward is None else f"{sizing.risk_reward:.2f}")
+        st.caption(
+            "建议股数取‘风险预算限制’和‘仓位上限限制’中较小者，并按100股整数倍向下取整；"
+            "实际成交可能受价格跳空、滑点和流动性影响。"
+        )
+        for warning in sizing.warnings:
+            st.warning(warning, icon=":material/warning:")
+
+        if save_plan:
+            if not sizing.valid:
+                st.error("交易计划参数不完整，暂不能保存。")
+            elif not thesis.strip() or not invalidation.strip():
+                st.error("请填写买入/观察理由，以及判断错误的条件。")
+            else:
+                plan = TradePlan(
+                    id=None,
+                    account_id=get_paper_account_id(),
+                    symbol=security.symbol,
+                    direction=direction,
+                    setup=setup,
+                    horizon=horizon,
+                    entry_price=float(entry_price),
+                    stop_loss=float(stop_loss),
+                    take_profit=float(take_profit),
+                    total_capital=float(total_capital),
+                    risk_pct=float(risk_pct) / 100,
+                    max_position_pct=float(max_position_pct) / 100,
+                    planned_shares=sizing.suggested_shares,
+                    planned_amount=sizing.planned_amount,
+                    risk_budget=sizing.risk_budget,
+                    estimated_max_loss=sizing.estimated_max_loss,
+                    risk_reward=sizing.risk_reward,
+                    thesis=thesis.strip(),
+                    invalidation=invalidation.strip(),
+                )
+                plan_id = get_store().save_trade_plan(plan)
+                st.success(f"交易计划已保存（编号 {plan_id}）。确认计划后，再到‘模拟交易’页提交订单。", icon=":material/task_alt:")
+
+
+def show_trade_reviews(security: Security) -> None:
+    """Record execution quality and mistakes after a simulated trade."""
+    store = get_store()
+    account_id = get_paper_account_id()
+    plans = store.load_trade_plans(account_id, security.symbol, limit=20)
+    plan_labels = ["不关联交易计划"]
+    plan_by_label: dict[str, int | None] = {plan_labels[0]: None}
+    for plan in plans:
+        label = f"#{plan.id} · {plan.created_at or '未知时间'} · {plan.direction} · {plan.planned_shares}股"
+        plan_labels.append(label)
+        plan_by_label[label] = plan.id
+
+    with st.container(border=True):
+        st.markdown("**交易后复盘**")
+        st.caption("复盘不是给自己打分，而是区分‘策略判断错误’和‘执行没有按计划进行’。")
+        with st.form(f"trade_review_{security.symbol}", border=False):
+            review_cols = st.columns(3)
+            selected_plan = review_cols[0].selectbox("关联计划", plan_labels)
+            review_date = review_cols[1].date_input("复盘日期", value=date.today())
+            outcome = review_cols[2].selectbox("当前结果", ["执行中", "盈利", "亏损", "持平", "取消计划"])
+            adherence = st.slider("计划执行度（%）", min_value=0, max_value=100, value=100, step=5)
+            mistake_tags = st.multiselect(
+                "本次是否出现以下情况？",
+                ["追涨", "恐慌卖出", "仓位过重", "没有止损", "过早卖出", "信号不足仍然买入", "按计划执行"],
+            )
+            notes = st.text_area("复盘笔记", placeholder="记录当时的想法、实际执行和下一次改进办法。")
+            save_review = st.form_submit_button("保存复盘", icon=":material/edit_note:")
+        if save_review:
+            review = TradeReview(
+                id=None,
+                account_id=account_id,
+                symbol=security.symbol,
+                plan_id=plan_by_label[selected_plan],
+                review_date=review_date.isoformat(),
+                outcome=outcome,
+                execution_adherence=int(adherence),
+                mistake_tags=tuple(mistake_tags),
+                notes=notes.strip(),
+            )
+            review_id = store.save_trade_review(review)
+            st.success(f"复盘已保存（编号 {review_id}）。", icon=":material/task_alt:")
+
+        reviews = store.load_trade_reviews(account_id, security.symbol, limit=50)
+        if not reviews:
+            st.info("这只股票还没有复盘记录。")
+            return
+        avg_adherence = sum(item.execution_adherence for item in reviews) / len(reviews)
+        summary_cols = st.columns(3)
+        summary_cols[0].metric("复盘次数", len(reviews))
+        summary_cols[1].metric("平均计划执行度", f"{avg_adherence:.0f}%")
+        summary_cols[2].metric("出现错误标签的次数", sum(bool(item.mistake_tags) for item in reviews))
+        review_frame = pd.DataFrame(
+            [
+                {
+                    "复盘日期": item.review_date,
+                    "结果": item.outcome,
+                    "计划执行度": f"{item.execution_adherence}%",
+                    "问题标签": "、".join(item.mistake_tags) or "无",
+                    "笔记": item.notes,
+                }
+                for item in reviews
+            ]
+        )
+        st.dataframe(review_frame, width="stretch", hide_index=True)
+
+
 def _report_comparison_frame(reports: list[BacktestReport]) -> pd.DataFrame:
     rows = [
         ("历史信号数", lambda report: str(report.signal_count)),
@@ -1428,6 +1700,24 @@ def show_data_quality_center(history, indicators, financials) -> None:
             st.warning(warning, icon=":material/warning:")
 
 
+def persist_alert_settings() -> None:
+    settings = (
+        bool(st.session_state.get("alerts_enabled", True)),
+        float(st.session_state.get("price_alert_threshold", 3.0)),
+        float(st.session_state.get("score_alert_threshold", 5.0)),
+    )
+    if settings == st.session_state.get("_saved_alert_settings"):
+        return
+    try:
+        get_store().save_alert_settings(
+            get_paper_account_id(), settings[0], settings[1], settings[2]
+        )
+    except Exception:
+        st.warning("提醒设置保存失败，本次会话仍会生效。", icon=":material/cloud_off:")
+        return
+    st.session_state["_saved_alert_settings"] = settings
+
+
 def show_personal_tools_sidebar() -> None:
     watchlist = st.session_state["watchlist"]
     if watchlist:
@@ -1482,12 +1772,13 @@ def show_personal_tools_sidebar() -> None:
                 key="score_alert_threshold",
             )
             st.caption("重新查询同一股票时，与本次会话上一次记录比较。")
+    persist_alert_settings()
 
     if watchlist or recent:
         if _is_local_runtime():
             st.caption("本地模式：自选股、最近查询、提醒快照和模拟交易保存在 data/stock_analysis.db。")
         else:
-            st.caption("公开部署：当前数据按浏览器会话隔离；多人长期保存需要登录和外部数据库。")
+            st.caption("公开部署：已登录用户的数据按账号隔离，并保存到 Supabase 云端。")
 
 
 def show_portfolio(service: PaperTradingService, symbol: str | None = None, price: float | None = None) -> None:
@@ -1545,8 +1836,26 @@ def show_portfolio(service: PaperTradingService, symbol: str | None = None, pric
         )
 
 
+def show_account_status() -> None:
+    if _is_local_runtime():
+        st.caption("本地运行：个人数据保存在本机 SQLite 数据库。")
+        return
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.caption(f"已登录：{current_user_email()}　·　数据保存：云端同步")
+        if st.button("退出登录", icon=":material/logout:"):
+            logout()
+
+
 def main() -> None:
-    initialize_session_state()
+    if not _is_local_runtime() and not ensure_authenticated():
+        return
+    try:
+        initialize_session_state()
+    except Exception as exc:
+        st.error(cloud_persistence_error_message(exc))
+        st.caption("行情接口异常只会影响行情分析；此错误表示个人数据存储尚未准备好。")
+        return
+    show_account_status()
     st.title("📈 A股股票分析与模拟交易")
     st.caption(f"{APP_VERSION} · 真实收盘日线 · 透明规则评分 · 虚拟资金，不连接真实券商")
     st.info("本工具仅供研究和学习参考，不构成投资建议。数据可能存在延迟、缺失或接口异常。")
@@ -1665,6 +1974,7 @@ def main() -> None:
         with tabs[0]:
             show_strategy_result(strategy_result)
             show_holding_ratio_guidance(strategy_result)
+            show_trade_plan(security, strategy_result, latest)
             with st.expander("原综合评分对照", expanded=False):
                 show_horizon_overview(results)
                 for key in ("short", "swing", "long"):
@@ -1718,6 +2028,7 @@ def main() -> None:
                 except Exception as exc:
                     st.error(str(exc))
             show_portfolio(paper, security.symbol, float(latest["close"]))
+            show_trade_reviews(security)
 
     if tabs[5].open:
         with tabs[5]:

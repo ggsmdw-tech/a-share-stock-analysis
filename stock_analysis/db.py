@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-from .models import PaperOrder, Security
+from .models import PaperOrder, Security, TradePlan, TradeReview
 
 
 class SQLiteStore:
@@ -139,6 +139,57 @@ class SQLiteStore:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (account_id, symbol)
                 );
+
+                CREATE TABLE IF NOT EXISTS user_alert_settings (
+                    account_id TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    price_threshold REAL NOT NULL DEFAULT 3.0,
+                    score_threshold REAL NOT NULL DEFAULT 5.0,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS trade_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    setup TEXT NOT NULL,
+                    horizon TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    take_profit REAL NOT NULL,
+                    total_capital REAL NOT NULL,
+                    risk_pct REAL NOT NULL,
+                    max_position_pct REAL NOT NULL,
+                    planned_shares INTEGER NOT NULL,
+                    planned_amount REAL NOT NULL,
+                    risk_budget REAL NOT NULL,
+                    estimated_max_loss REAL NOT NULL,
+                    risk_reward REAL,
+                    thesis TEXT NOT NULL DEFAULT '',
+                    invalidation TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'planned',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trade_plans_account_symbol
+                    ON trade_plans(account_id, symbol, created_at);
+
+                CREATE TABLE IF NOT EXISTS trade_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    plan_id INTEGER,
+                    review_date TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    execution_adherence INTEGER NOT NULL,
+                    mistake_tags TEXT NOT NULL DEFAULT '[]',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trade_reviews_account_symbol
+                    ON trade_reviews(account_id, symbol, review_date);
                 """
             )
             self._migrate_source_aware_cache(connection)
@@ -468,6 +519,51 @@ class SQLiteStore:
                 (account_id, safe_limit),
             ).fetchall()
         return {row["symbol"]: dict(row) for row in reversed(rows)}
+
+    def save_alert_settings(
+        self,
+        account_id: str,
+        enabled: bool,
+        price_threshold: float,
+        score_threshold: float,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_alert_settings(
+                    account_id, enabled, price_threshold, score_threshold, updated_at
+                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    price_threshold=excluded.price_threshold,
+                    score_threshold=excluded.score_threshold,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    account_id,
+                    1 if enabled else 0,
+                    float(price_threshold),
+                    float(score_threshold),
+                ),
+            )
+
+    def load_alert_settings(self, account_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT enabled, price_threshold, score_threshold
+                FROM user_alert_settings
+                WHERE account_id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "enabled": bool(row["enabled"]),
+            "price_threshold": float(row["price_threshold"]),
+            "score_threshold": float(row["score_threshold"]),
+        }
 
     def upsert_securities(self, securities: Iterable[Security]) -> None:
         rows = [
@@ -849,3 +945,118 @@ class SQLiteStore:
                 (account_id,),
             ).fetchall()
         return [PaperOrder(**dict(row)) for row in rows]
+
+    def save_trade_plan(self, plan: TradePlan) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO trade_plans(
+                    account_id, symbol, direction, setup, horizon,
+                    entry_price, stop_loss, take_profit, total_capital,
+                    risk_pct, max_position_pct, planned_shares, planned_amount,
+                    risk_budget, estimated_max_loss, risk_reward, thesis,
+                    invalidation, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan.account_id,
+                    plan.symbol,
+                    plan.direction,
+                    plan.setup,
+                    plan.horizon,
+                    plan.entry_price,
+                    plan.stop_loss,
+                    plan.take_profit,
+                    plan.total_capital,
+                    plan.risk_pct,
+                    plan.max_position_pct,
+                    plan.planned_shares,
+                    plan.planned_amount,
+                    plan.risk_budget,
+                    plan.estimated_max_loss,
+                    plan.risk_reward,
+                    plan.thesis,
+                    plan.invalidation,
+                    plan.status,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def load_trade_plans(
+        self, account_id: str, symbol: str | None = None, limit: int = 20
+    ) -> list[TradePlan]:
+        clauses = ["account_id = ?"]
+        params: list[Any] = [account_id]
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        params.append(int(limit))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, account_id, symbol, direction, setup, horizon,
+                       entry_price, stop_loss, take_profit, total_capital,
+                       risk_pct, max_position_pct, planned_shares, planned_amount,
+                       risk_budget, estimated_max_loss, risk_reward, thesis,
+                       invalidation, status, created_at
+                FROM trade_plans
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [TradePlan(**dict(row)) for row in rows]
+
+    def save_trade_review(self, review: TradeReview) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO trade_reviews(
+                    account_id, symbol, plan_id, review_date, outcome,
+                    execution_adherence, mistake_tags, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review.account_id,
+                    review.symbol,
+                    review.plan_id,
+                    review.review_date,
+                    review.outcome,
+                    int(review.execution_adherence),
+                    json.dumps(list(review.mistake_tags), ensure_ascii=False),
+                    review.notes,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def load_trade_reviews(
+        self, account_id: str, symbol: str | None = None, limit: int = 50
+    ) -> list[TradeReview]:
+        clauses = ["account_id = ?"]
+        params: list[Any] = [account_id]
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        params.append(int(limit))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, account_id, symbol, plan_id, review_date, outcome,
+                       execution_adherence, mistake_tags, notes
+                FROM trade_reviews
+                WHERE {' AND '.join(clauses)}
+                ORDER BY review_date DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        reviews: list[TradeReview] = []
+        for row in rows:
+            payload = dict(row)
+            try:
+                tags = tuple(json.loads(payload.pop("mistake_tags") or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                tags = tuple()
+            reviews.append(TradeReview(**payload, mistake_tags=tags))
+        return reviews

@@ -1,6 +1,6 @@
-# A股股票分析与模拟交易应用 · v0.02 数据可信度版
+# A股股票分析与模拟交易应用 · v0.04 多用户云端持久化版
 
-当前版本为 v0.02 数据可信度版，用于验证真实公开行情、数据质量检查、评分依据、市场对照、历史验证和模拟交易流程。
+当前版本为 v0.04 多用户云端持久化版，用于验证真实公开行情、数据质量检查、评分依据、市场对照、历史验证、模拟交易和多用户数据隔离流程。
 
 这是一个本地运行的中文 Streamlit 应用，支持：
 
@@ -34,7 +34,22 @@ py -3.12 -m venv .venv
 
 浏览器打开 Streamlit 显示的本地地址即可。
 
-需要发给别人使用时，优先看 [DEPLOY.md](DEPLOY.md)。Windows 用户也可以双击 `start_app.bat` 一键安装依赖并启动；该方式要求对方电脑已安装 Python 3.12，并且能访问腾讯/AKShare等公开数据接口。
+需要发给别人使用时，优先看 [DEPLOY.md](DEPLOY.md)。公开网址模式使用 Supabase 邮箱登录和云端个人数据；Windows 本地分享包仍要求对方电脑安装 Python 3.12。
+
+## v0.04 多用户云端模式
+
+线上部署后，用户必须注册并验证邮箱。Supabase 用户 UUID 作为个人账户标识，搜索、自选股、提醒、模拟账户、订单、交易计划和复盘记录保存在 Supabase PostgreSQL 中；RLS 确保用户只能访问自己的数据。
+
+部署前请执行 [`supabase/schema.sql`](supabase/schema.sql)，并在 Streamlit Community Cloud Secrets 中配置：
+
+```toml
+SUPABASE_URL = "https://YOUR_PROJECT.supabase.co"
+SUPABASE_ANON_KEY = "YOUR_PUBLIC_ANON_KEY"
+```
+
+只使用 Supabase 公共 `anon` key，绝不把 `service_role` key 放入代码、Secrets 或 GitHub。完整步骤见 [DEPLOY.md](DEPLOY.md) 和 [supabase/README.md](supabase/README.md)。
+
+本地配置示例见 [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example)。仓库的 GitHub Actions 会在提交到 `main` 或创建 Pull Request 时自动运行语法检查和 53 项测试。
 
 ## 本地数据持久化
 
@@ -61,7 +76,10 @@ stock_analysis/strategy.py     趋势动量波段策略
 stock_analysis/backtest.py     原规则与优化策略历史回测
 stock_analysis/quality.py      数据可信度检查
 stock_analysis/db.py           SQLite 存储
+stock_analysis/cloud_store.py  Supabase 用户数据存储和 HybridStore
+stock_analysis/auth.py         Supabase 邮箱认证和浏览器会话恢复
 stock_analysis/paper.py        模拟交易
+supabase/schema.sql            云端表、RLS 和原子订单 RPC
 tests/                         自动化测试
 ```
 
