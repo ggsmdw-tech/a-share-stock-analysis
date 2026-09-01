@@ -1,6 +1,30 @@
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
+$port = 8501
+$localUrl = "http://localhost:$port/"
+
+function Test-AppReady {
+    try {
+        $response = Invoke-WebRequest -Uri $localUrl -UseBasicParsing -TimeoutSec 2
+        return $response.StatusCode -eq 200
+    } catch {
+        return $false
+    }
+}
+
+if (Test-AppReady) {
+    Start-Process $localUrl
+    Write-Host "Streamlit is already running at $localUrl"
+    exit 0
+}
+
+$portOwner = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($null -ne $portOwner) {
+    throw "Port $port is already used by another process. Close it or run the app on a different port."
+}
+
 $venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $venvPython)) {
     $created = $false
@@ -22,37 +46,58 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     }
 }
 
-& $venvPython -m pip install --disable-pip-version-check -r (Join-Path $PSScriptRoot "requirements.txt")
-if ($LASTEXITCODE -ne 0) {
-    throw "Dependency installation failed. Check the network and try again."
+$requirementsPath = Join-Path $PSScriptRoot "requirements.txt"
+$dependencyMarker = Join-Path $PSScriptRoot ".venv\.requirements.sha256"
+$requirementsHash = (Get-FileHash -LiteralPath $requirementsPath -Algorithm SHA256).Hash
+$installedHash = if (Test-Path -LiteralPath $dependencyMarker) {
+    (Get-Content -LiteralPath $dependencyMarker -Raw).Trim()
+} else {
+    ""
+}
+
+$dependenciesReady = $installedHash -eq $requirementsHash
+if ($dependenciesReady) {
+    & $venvPython -m pip check | Out-Null
+    $dependenciesReady = $LASTEXITCODE -eq 0
+}
+
+if (-not $dependenciesReady) {
+    Write-Host "Installing or updating Python dependencies..."
+    & $venvPython -m pip install --disable-pip-version-check -r $requirementsPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Dependency installation failed. Check the network and try again."
+    }
+    & $venvPython -m pip check
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installed dependencies have conflicts. Check requirements.txt."
+    }
+    Set-Content -LiteralPath $dependencyMarker -Value $requirementsHash -Encoding ascii
 }
 
 $serverArgs = @(
     "-m", "streamlit", "run", "app.py",
-    "--server.headless=true", "--server.port=8501"
+    "--server.headless=true", "--server.port=$port"
 )
 $server = Start-Process -FilePath $venvPython -ArgumentList $serverArgs -WorkingDirectory $PSScriptRoot -PassThru
 $ready = $false
 try {
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         Start-Sleep -Milliseconds 500
-        try {
-            $null = Invoke-WebRequest -Uri "http://127.0.0.1:8501/" -UseBasicParsing -TimeoutSec 2
+        if (Test-AppReady) {
             $ready = $true
             break
-        } catch {
-            if ($server.HasExited) {
-                throw "Streamlit failed to start. Run python -m streamlit run app.py to view logs."
-            }
+        }
+        if ($server.HasExited) {
+            throw "Streamlit failed to start. Run python -m streamlit run app.py to view logs."
         }
     }
 
     if ($ready) {
-        Start-Process "http://localhost:8501/"
-        Write-Host "App started at http://localhost:8501/"
+        Start-Process $localUrl
+        Write-Host "App started at $localUrl"
         Write-Host "Closing this window will stop the app."
     } else {
-        throw "App startup timed out. Check whether port 8501 is already in use."
+        throw "App startup timed out. Check whether port $port is already in use."
     }
     Wait-Process -Id $server.Id
 } finally {

@@ -34,6 +34,8 @@ py -3.12 -m venv .venv
 
 浏览器打开 Streamlit 显示的本地地址即可。
 
+Windows 用户也可以双击 `start_app.bat`。启动脚本会自动检测 8501 端口；如果应用已经运行，会直接打开已有页面。依赖没有变化时不会重复联网安装，适合每天重启电脑后使用。
+
 需要发给别人使用时，优先看 [DEPLOY.md](DEPLOY.md)。公开网址模式使用 Supabase 邮箱登录和云端个人数据；Windows 本地分享包仍要求对方电脑安装 Python 3.12。
 
 ## v0.04 多用户云端模式
@@ -49,7 +51,7 @@ SUPABASE_ANON_KEY = "YOUR_PUBLIC_ANON_KEY"
 
 只使用 Supabase 公共 `anon` key，绝不把 `service_role` key 放入代码、Secrets 或 GitHub。完整步骤见 [DEPLOY.md](DEPLOY.md) 和 [supabase/README.md](supabase/README.md)。
 
-本地配置示例见 [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example)。仓库的 GitHub Actions 会在提交到 `main` 或创建 Pull Request 时自动运行语法检查和 53 项测试。
+本地配置示例见 [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example)。仓库的 GitHub Actions 会在提交到 `main` 或创建 Pull Request 时自动运行语法检查和完整测试。
 
 ## 本地数据持久化
 

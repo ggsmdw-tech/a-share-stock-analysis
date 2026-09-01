@@ -40,7 +40,7 @@
 powershell -ExecutionPolicy Bypass -File .\package_for_sharing.ps1
 ```
 
-把生成的 ZIP 发给对方。对方解压后双击 `start_app.bat`，脚本会创建虚拟环境、安装依赖、启动应用并打开浏览器。
+把生成的 ZIP 发给对方。对方解压后双击 `start_app.bat`，脚本会创建虚拟环境、安装依赖、启动应用并打开浏览器；后续依赖未变化时会跳过重复安装，并检测 8501 端口是否已有服务。
 
 这种方式要求对方安装 Python 3.12，并允许 Python 访问互联网。若对方电脑没有 Python，公共网址方式更方便；本项目没有把 Python 和全部依赖打包进仓库。
 
