@@ -149,9 +149,15 @@ def browser_session_storage(
         width="stretch",
         height=1,
     )
-    state = st.session_state.get("supabase_browser_session", {})
-    if not isinstance(state, dict):
-        state = {}
+    raw_state = st.session_state.get("supabase_browser_session", {})
+    if isinstance(raw_state, dict):
+        # CCv2 may expose a read-only dict-like ComponentState here.
+        state = dict(raw_state)
+    else:
+        try:
+            state = dict(raw_state)
+        except (TypeError, ValueError):
+            state = {}
     for name in ("session", "hash_session", "ready"):
         value = _component_state_value(result, name)
         if value is not None:
