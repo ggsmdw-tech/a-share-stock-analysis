@@ -164,7 +164,8 @@ def browser_session_storage(
             state[name] = value
             if name == "ready" and bool(value):
                 st.session_state["supabase_browser_ready"] = True
-    st.session_state["supabase_browser_session"] = state
+    # The CCv2 component owns this session-state key and exposes it read-only.
+    # Keep the merged values local instead of writing back into the component key.
     browser_state_session = state.get("session")
     if (
         isinstance(browser_state_session, dict)
