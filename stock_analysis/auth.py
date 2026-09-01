@@ -38,23 +38,34 @@ def _browser_ready_changed() -> None:
     st.session_state["supabase_browser_ready"] = True
 
 
+def _component_state_value(state: Any, name: str) -> Any:
+    if isinstance(state, dict):
+        return state.get(name)
+    try:
+        return getattr(state, name, None)
+    except Exception:
+        return None
+
+
 _BROWSER_SESSION = st.components.v2.component(
     "supabase_session_storage",
     html="""
-<div aria-hidden="true"></div>
+<div data-session-root aria-hidden="true"></div>
 """,
     js="""
 export default function (component) {
   const { data, parentElement, setStateValue } = component
   if (!parentElement) return
+  const root = parentElement.querySelector("[data-session-root]")
+  if (!root) return
 
   const storageKey = (data && data.storage_key) || "a_share_stock_analysis_supabase_session"
   const incoming = (data && data.session) || null
   const clear = Boolean(data && data.clear)
   const incomingText = JSON.stringify(incoming || null)
 
-  if (parentElement.dataset.incomingText !== incomingText || clear) {
-    parentElement.dataset.incomingText = incomingText
+  if (root.dataset.incomingText !== incomingText || clear) {
+    root.dataset.incomingText = incomingText
     if (clear) {
       localStorage.removeItem(storageKey)
       setStateValue("session", {})
@@ -70,8 +81,8 @@ export default function (component) {
     }
   }
 
-  if (parentElement.dataset.restored !== "1") {
-    parentElement.dataset.restored = "1"
+  if (root.dataset.restored !== "1") {
+    root.dataset.restored = "1"
     const stored = localStorage.getItem(storageKey)
     if (stored) {
       try {
@@ -83,8 +94,8 @@ export default function (component) {
         localStorage.removeItem(storageKey)
       }
     }
-    if (parentElement.dataset.hashProcessed !== "1") {
-      parentElement.dataset.hashProcessed = "1"
+    if (root.dataset.hashProcessed !== "1") {
+      root.dataset.hashProcessed = "1"
       const hashText = (window.location.hash || "").replace(/^#/, "")
       const hashParams = new URLSearchParams(hashText)
       const accessToken = hashParams.get("access_token")
@@ -120,7 +131,7 @@ def browser_session_storage(
     query parameters.
     """
 
-    _BROWSER_SESSION(
+    result = _BROWSER_SESSION(
         data={
             "storage_key": _BROWSER_STORAGE_KEY,
             "session": session or {},
@@ -134,9 +145,16 @@ def browser_session_storage(
         height=1,
     )
     state = st.session_state.get("supabase_browser_session", {})
-    if isinstance(state, dict):
-        return state
-    return {}
+    if not isinstance(state, dict):
+        state = {}
+    for name in ("session", "hash_session", "ready"):
+        value = _component_state_value(result, name)
+        if value is not None:
+            state[name] = value
+            if name == "ready" and bool(value):
+                st.session_state["supabase_browser_ready"] = True
+    st.session_state["supabase_browser_session"] = state
+    return state
 
 
 def get_supabase_config() -> SupabaseConfig | None:
@@ -188,6 +206,15 @@ def session_to_dict(session: Any) -> dict[str, Any] | None:
         if value is not None:
             payload[key] = value
     return payload
+
+
+def _clear_auth_state(*, clear_browser: bool = False) -> None:
+    """Remove identity state before showing the login gate again."""
+    for key in ("supabase_session", "auth_user_id", "auth_user_email"):
+        st.session_state.pop(key, None)
+    st.session_state["supabase_recovery"] = False
+    if clear_browser:
+        st.session_state["_clear_browser_session"] = True
 
 
 def _response_value(response: Any, name: str) -> Any:
@@ -278,6 +305,10 @@ def ensure_authenticated() -> bool:
     browser_session_storage(st.session_state.get("supabase_session"), clear=clear_browser)
     if not st.session_state.get("supabase_browser_ready", False):
         st.info("正在恢复登录状态，请稍候…")
+        if st.button("无法恢复？进入登录页面", key="auth_recovery_fallback"):
+            _clear_auth_state(clear_browser=True)
+            st.session_state["supabase_browser_ready"] = True
+            st.rerun()
         return False
 
     try:
@@ -326,11 +357,7 @@ def ensure_authenticated() -> bool:
                     return False
                 return True
         except Exception:
-            st.session_state.pop("supabase_session", None)
-            st.session_state.pop("auth_user_id", None)
-            st.session_state.pop("auth_user_email", None)
-            st.session_state["supabase_recovery"] = False
-            st.session_state["_clear_browser_session"] = True
+            _clear_auth_state(clear_browser=True)
             st.info("登录状态已过期，请重新登录。")
 
     st.title("登录 A股股票分析应用")
@@ -416,11 +443,7 @@ def logout() -> None:
             create_supabase_client(config).auth.sign_out()
         except Exception:
             pass
-    st.session_state.pop("supabase_session", None)
-    st.session_state.pop("auth_user_id", None)
-    st.session_state.pop("auth_user_email", None)
-    st.session_state["supabase_recovery"] = False
-    st.session_state["_clear_browser_session"] = True
+    _clear_auth_state(clear_browser=True)
     st.rerun()
 
 
