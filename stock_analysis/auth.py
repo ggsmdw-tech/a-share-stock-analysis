@@ -56,8 +56,13 @@ _BROWSER_SESSION = st.components.v2.component(
 export default function (component) {
   const { data, parentElement, setStateValue } = component
   if (!parentElement) return
-  const root = parentElement.querySelector("[data-session-root]")
-  if (!root) return
+  const root = typeof parentElement.querySelector === "function"
+    ? parentElement.querySelector("[data-session-root]")
+    : null
+  if (!root) {
+    setStateValue("ready", true)
+    return
+  }
 
   const storageKey = (data && data.storage_key) || "a_share_stock_analysis_supabase_session"
   const incoming = (data && data.session) || null
@@ -154,6 +159,21 @@ def browser_session_storage(
             if name == "ready" and bool(value):
                 st.session_state["supabase_browser_ready"] = True
     st.session_state["supabase_browser_session"] = state
+    browser_state_session = state.get("session")
+    if (
+        isinstance(browser_state_session, dict)
+        and browser_state_session.get("access_token")
+        and browser_state_session.get("refresh_token")
+    ):
+        st.session_state["supabase_session"] = browser_state_session
+    hash_state_session = state.get("hash_session")
+    if (
+        isinstance(hash_state_session, dict)
+        and hash_state_session.get("access_token")
+        and hash_state_session.get("refresh_token")
+    ):
+        st.session_state["supabase_session"] = hash_state_session
+        st.session_state["supabase_recovery"] = hash_state_session.get("type") == "recovery"
     return state
 
 
@@ -304,12 +324,7 @@ def ensure_authenticated() -> bool:
     clear_browser = bool(st.session_state.pop("_clear_browser_session", False))
     browser_session_storage(st.session_state.get("supabase_session"), clear=clear_browser)
     if not st.session_state.get("supabase_browser_ready", False):
-        st.info("正在恢复登录状态，请稍候…")
-        if st.button("无法恢复？进入登录页面", key="auth_recovery_fallback"):
-            _clear_auth_state(clear_browser=True)
-            st.session_state["supabase_browser_ready"] = True
-            st.rerun()
-        return False
+        st.info("正在尝试恢复登录状态；如果没有自动恢复，也可以直接登录。")
 
     try:
         client = create_supabase_client(config)
