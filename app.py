@@ -611,9 +611,15 @@ def show_strategy_guide() -> None:
 
 
 def _is_local_runtime() -> bool:
+    """Use SQLite only for local runs without Supabase credentials.
+
+    Supplying Streamlit secrets locally intentionally enables the same online
+    auth and cloud-persistence path used by a deployed app.
+    """
     current_url = getattr(st.context, "url", "") or ""
     host = (urlsplit(current_url).hostname or "").lower()
-    return not host or host in {"localhost", "127.0.0.1", "::1"}
+    is_local_host = not host or host in {"localhost", "127.0.0.1", "::1"}
+    return is_local_host and get_supabase_config() is None
 
 
 def get_paper_account_id() -> str:
@@ -1846,9 +1852,14 @@ def show_account_status() -> None:
             logout()
 
 
-def main() -> None:
+def require_authentication() -> None:
+    """Stop the page before any user-scoped data or protected UI is rendered."""
     if not _is_local_runtime() and not ensure_authenticated():
-        return
+        st.stop()
+
+
+def main() -> None:
+    require_authentication()
     try:
         initialize_session_state()
     except Exception as exc:
@@ -1897,19 +1908,39 @@ def main() -> None:
         try:
             with st.spinner("正在获取数据并计算指标…"):
                 analysis = run_analysis(query)
-                st.session_state.analysis = analysis
-                analyzed_security, analyzed_history, analyzed_indicators, _, analyzed_results = analysis
+            # Persist the successful analysis before optional cloud side effects.
+            # If a user-data write fails, a rerun must not erase the visible result.
+            st.session_state["analysis"] = analysis
+            st.session_state["analysis_key"] = request_key
+            analyzed_security, analyzed_history, analyzed_indicators, _, analyzed_results = analysis
+            try:
                 remember_query(analyzed_security, analyzed_history)
+            except Exception as exc:
+                st.warning(
+                    "分析已完成，但最近查询记录暂时无法同步到云端："
+                    f"{cloud_persistence_error_message(exc)}",
+                    icon=":material/cloud_off:",
+                )
+            try:
                 st.session_state["analysis_alerts"] = record_change_alerts(
                     analyzed_security,
                     analyzed_indicators,
                     analyzed_results["short"],
                 )
+            except Exception as exc:
+                st.warning(
+                    "分析已完成，但价格/评分提醒快照暂时无法保存："
+                    f"{cloud_persistence_error_message(exc)}",
+                    icon=":material/notifications_off:",
+                )
+            try:
                 st.query_params["symbol"] = analyzed_security.code
-                st.session_state.analysis_key = request_key
+            except Exception:
+                # The URL is only a sharing convenience and must not block results.
+                pass
         except Exception as exc:
-            st.session_state.analysis_error = str(exc)
-            st.session_state.analysis_key = request_key
+            st.session_state["analysis_error"] = str(exc)
+            st.session_state["analysis_key"] = request_key
 
     if st.session_state.get("analysis_error"):
         st.error(st.session_state.analysis_error)
