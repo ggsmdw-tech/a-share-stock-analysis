@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from datetime import date, timedelta
@@ -21,6 +22,27 @@ KNOWN_SECURITY_NAMES = {
     "600519": "贵州茅台",
     "601318": "中国平安",
 }
+
+
+def _call_with_timeout(function, timeout_seconds: float, *args, **kwargs):
+    """Limit a blocking public-data SDK call in the web process."""
+    result = []
+    error = []
+
+    def worker() -> None:
+        try:
+            result.append(function(*args, **kwargs))
+        except Exception as exc:
+            error.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(max(0.1, float(timeout_seconds)))
+    if thread.is_alive():
+        raise TimeoutError(f"public data endpoint timed out after {timeout_seconds:g}s")
+    if error:
+        raise error[0]
+    return result[0] if result else None
 
 
 def normalize_code(query: str) -> str:
@@ -252,7 +274,7 @@ class PublicDataProvider(StockDataProvider):
         if self.ak is None:
             raise RuntimeError("名称查询需要 AKShare 股票列表接口，请改用6位股票代码查询。")
         try:
-            frame = self.ak.stock_info_a_code_name()
+            frame = _call_with_timeout(self.ak.stock_info_a_code_name, 12)
         except Exception as exc:
             raise RuntimeError(
                 "股票列表接口暂时不可用，请改用6位股票代码查询。"
@@ -284,9 +306,12 @@ class PublicDataProvider(StockDataProvider):
     ) -> pd.DataFrame:
         self.last_market_data_note = ""
         self.last_market_data_source = self.source_name
+        deadline = time.monotonic() + 45.0
 
         try:
-            frame = self._load_tencent_market_data(security, start_date, end_date)
+            frame = self._load_tencent_market_data(
+                security, start_date, end_date, deadline
+            )
             self.last_market_data_source = "tencent"
             return frame
         except Exception as tencent_error:
@@ -298,7 +323,12 @@ class PublicDataProvider(StockDataProvider):
             last_error: Exception | None = None
             for attempt in range(2):
                 try:
-                    raw = self.ak.stock_zh_a_hist(
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("public market data deadline exceeded")
+                    raw = _call_with_timeout(
+                        self.ak.stock_zh_a_hist,
+                        min(12.0, remaining),
                         symbol=security.code,
                         period="daily",
                         start_date=pd.Timestamp(begin).strftime("%Y%m%d"),
@@ -332,6 +362,8 @@ class PublicDataProvider(StockDataProvider):
                 chunks = []
                 cursor = start_date
                 while cursor <= end_date:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("public market data deadline exceeded")
                     chunk_end = min(cursor + timedelta(days=364), end_date)
                     chunks.append(fetch_range(cursor, chunk_end))
                     cursor = chunk_end + timedelta(days=1)
@@ -347,7 +379,11 @@ class PublicDataProvider(StockDataProvider):
             ) from akshare_error
 
     def _load_tencent_market_data(
-        self, security: Security, start_date: date, end_date: date
+        self,
+        security: Security,
+        start_date: date,
+        end_date: date,
+        deadline: float | None = None,
     ) -> pd.DataFrame:
         prefix = {"SSE": "sh", "SZSE": "sz", "BSE": "bj"}.get(security.exchange)
         if prefix is None:
@@ -356,6 +392,13 @@ class PublicDataProvider(StockDataProvider):
         endpoint = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
         frames = []
         for year in range(start_date.year, end_date.year + 1):
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("public market data deadline exceeded")
+                request_timeout = min(8.0, remaining)
+            else:
+                request_timeout = 8.0
             begin = max(start_date, date(year, 1, 1))
             finish = min(end_date, date(year, 12, 31))
             response = requests.get(
@@ -372,7 +415,7 @@ class PublicDataProvider(StockDataProvider):
                     "User-Agent": "Mozilla/5.0",
                     "Referer": "https://stockapp.finance.qq.com/",
                 },
-                timeout=15,
+                timeout=request_timeout,
             )
             response.raise_for_status()
             payload = self._parse_tencent_payload(response.text)
@@ -424,7 +467,9 @@ class PublicDataProvider(StockDataProvider):
         if market is None:
             raise ValueError("暂不支持该股票交易所的主力资金数据")
         try:
-            frame = self.ak.stock_individual_fund_flow(
+            frame = _call_with_timeout(
+                self.ak.stock_individual_fund_flow,
+                15,
                 stock=security.code,
                 market=market,
             )
@@ -441,7 +486,7 @@ class PublicDataProvider(StockDataProvider):
             response = requests.get(
                 "https://qt.gtimg.cn/q=" + prefix + code,
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10,
+                timeout=6,
             )
             response.raise_for_status()
             text = response.content.decode("gb18030", errors="replace")
@@ -493,7 +538,11 @@ class PublicDataProvider(StockDataProvider):
         if self.ak is None:
             return {}
         try:
-            frame = self.ak.stock_financial_analysis_indicator(symbol=security.code)
+            frame = _call_with_timeout(
+                self.ak.stock_financial_analysis_indicator,
+                15,
+                symbol=security.code,
+            )
         except Exception:
             return {}
 

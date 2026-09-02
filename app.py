@@ -681,16 +681,24 @@ def build_price_chart(frame: pd.DataFrame) -> alt.Chart:
     return (wick + body + averages).properties(height=470).interactive()
 
 
-def run_analysis(query: str):
+def run_analysis(query: str, progress=None):
+    def report(message: str) -> None:
+        if callable(progress):
+            progress(message)
+
     provider = create_provider("public")
     service = StockDataService(provider, get_store())
+    report("\u6b63\u5728\u786e\u8ba4\u80a1\u7968\u4ee3\u7801\u548c\u540d\u79f0\u2026")
     security = service.resolve_security(query)
     start = date.today() - timedelta(days=365 * 3)
+    report(f"\u6b63\u5728\u83b7\u53d6 {security.name}\uff08{security.code}\uff09\u8fd1\u4e09\u5e74\u771f\u5b9e\u65e5\u7ebf\u2026")
     history = service.load_market_data(security, start, date.today())
     if history.data.empty:
         raise RuntimeError(history.message or "没有获取到行情数据")
     indicators = calculate_indicators(history)
+    report(f"\u5df2\u83b7\u53d6 {len(history.data)} \u6761\u884c\u60c5\uff0c\u6b63\u5728\u8ba1\u7b97\u6280\u672f\u6307\u6807\u2026")
     financials = service.load_financials(security)
+    report("\u6b63\u5728\u751f\u6210\u7efc\u5408\u8bc4\u5206\u548c\u8d8b\u52bf\u52a8\u91cf\u7b56\u7565\u2026")
     results = evaluate_all_horizons(indicators, financials)
     return security, history, indicators, financials, results
 
@@ -1892,6 +1900,7 @@ def main() -> None:
                 icon=":material/search:",
             )
     analyze = submitted or auto_analyze
+    analysis_feedback_slot = st.container()
     st.caption("支持6位股票代码、带交易所前缀的代码或股票名称；公开数据异常时不会生成买卖信号。")
     show_scoring_guide()
     show_strategy_guide()
@@ -1910,9 +1919,25 @@ def main() -> None:
         st.session_state["analysis_error"] = ""
         st.session_state.pop("analysis_error_query", None)
         st.session_state["analysis_alerts"] = []
+        progress_status = analysis_feedback_slot.status(
+            "\u6b63\u5728\u5f00\u59cb\u5206\u6790\uff0c\u8bf7\u7a0d\u5019\u2026",
+            expanded=True,
+        )
         try:
             with st.spinner("正在获取数据并计算指标…"):
-                analysis = run_analysis(query)
+                analysis = run_analysis(
+                    query,
+                    progress=lambda message: progress_status.update(
+                        label=message,
+                        state="running",
+                        expanded=True,
+                    ),
+                )
+            progress_status.update(
+                label="\u5206\u6790\u5b8c\u6210\uff0c\u6b63\u5728\u663e\u793a\u7ed3\u679c\u3002",
+                state="complete",
+                expanded=False,
+            )
             # Persist the successful analysis before optional cloud side effects.
             # If a user-data write fails, a rerun must not erase the visible result.
             st.session_state["analysis"] = analysis
@@ -1944,6 +1969,11 @@ def main() -> None:
                 # The URL is only a sharing convenience and must not block results.
                 pass
         except Exception as exc:
+            progress_status.update(
+                label="\u5206\u6790\u672a\u5b8c\u6210\uff0c\u8bf7\u67e5\u770b\u4e0b\u65b9\u9519\u8bef\u8bf4\u660e\u3002",
+                state="error",
+                expanded=True,
+            )
             st.session_state["analysis_error"] = str(exc)
             st.session_state["analysis_error_query"] = request_key
 
