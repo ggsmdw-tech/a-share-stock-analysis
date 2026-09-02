@@ -258,7 +258,8 @@ class PublicDataProvider(StockDataProvider):
         self.latest_valuation: dict[str, float | None] = {}
 
     def resolve_candidates(self, query: str) -> list[Security]:
-        value = str(query or "").strip().lower()
+        value = str(query or "").strip()
+        value_lower = value.lower()
         code = normalize_code(value)
 
         if code and exchange_for_code(code) != "UNKNOWN":
@@ -271,13 +272,28 @@ class PublicDataProvider(StockDataProvider):
                 )
             ]
 
+        # AKShare's full-market list is useful but has been intermittently
+        # unavailable on hosted deployments. Sina's suggestion endpoint is a
+        # real public search service and is much cheaper than downloading all
+        # A-share symbols just to resolve one name.
+        try:
+            sina_candidates = self._resolve_sina_candidates(value)
+        except Exception:
+            sina_candidates = []
+        if sina_candidates:
+            self.last_resolution_note = "已使用新浪公开股票搜索接口解析名称。"
+            return sina_candidates
+
         if self.ak is None:
-            raise RuntimeError("名称查询需要 AKShare 股票列表接口，请改用6位股票代码查询。")
+            raise RuntimeError(
+                "股票名称查询接口暂时不可用，请稍后重试或输入6位股票代码。"
+            )
         try:
             frame = _call_with_timeout(self.ak.stock_info_a_code_name, 12)
         except Exception as exc:
             raise RuntimeError(
-                "股票列表接口暂时不可用，请改用6位股票代码查询。"
+                "股票名称查询接口暂时不可用（新浪和 AKShare 均不可用），"
+                "请稍后重试或输入6位股票代码。"
             ) from exc
         frame = frame.rename(columns={"code": "code", "name": "name"})
         if "code" not in frame or "name" not in frame:
@@ -285,7 +301,7 @@ class PublicDataProvider(StockDataProvider):
         frame["code"] = frame["code"].astype(str).str.zfill(6)
         frame = frame[
             frame["name"].astype(str).str.lower().str.contains(
-                value, na=False, regex=False
+                value_lower, na=False, regex=False
             )
         ]
         results = []
@@ -300,6 +316,56 @@ class PublicDataProvider(StockDataProvider):
                 )
             )
         return results
+
+    def _resolve_sina_candidates(self, query: str) -> list[Security]:
+        """Resolve an A-share name/code fragment using Sina's public search."""
+        response = requests.get(
+            "https://suggest3.sinajs.cn/suggest/",
+            params={
+                "type": "11,12,13,14,15",
+                "key": str(query).strip(),
+                "name": "suggestdata",
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://finance.sina.com.cn/",
+            },
+            timeout=4,
+        )
+        response.raise_for_status()
+        # The endpoint declares GBK. Decode explicitly instead of relying on
+        # requests' default encoding, otherwise Chinese names become unreadable.
+        payload_text = response.content.decode("gb18030", errors="replace")
+        match = re.search(r'suggestdata\s*=\s*"(.*?)"', payload_text, flags=re.S)
+        if not match:
+            return []
+
+        candidates: list[Security] = []
+        seen_codes: set[str] = set()
+        for item in match.group(1).split(";"):
+            fields = [part.strip() for part in item.split(",")]
+            if len(fields) < 5:
+                continue
+            code = normalize_code(fields[2])
+            if not code or exchange_for_code(code) == "UNKNOWN" or code in seen_codes:
+                continue
+            name = fields[4] or fields[0]
+            if not name:
+                continue
+            seen_codes.add(code)
+            candidates.append(
+                Security(
+                    code=code,
+                    name=name,
+                    exchange=exchange_for_code(code),
+                    market_status=(
+                        "风险标记"
+                        if "ST" in name.upper() or "退" in name
+                        else "正常"
+                    ),
+                )
+            )
+        return candidates[:20]
 
     def load_market_data(
         self, security: Security, start_date: date, end_date: date

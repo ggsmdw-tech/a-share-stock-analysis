@@ -111,8 +111,28 @@ def test_name_resolution_reports_list_endpoint_failure():
             raise ConnectionError("blocked")
     provider = object.__new__(PublicDataProvider)
     provider.ak = BrokenListRequest()
-    with pytest.raises(RuntimeError, match="改用6位股票代码查询"):
+    provider._resolve_sina_candidates = lambda query: []
+    with pytest.raises(RuntimeError, match="股票名称查询接口暂时不可用"):
         provider.resolve_candidates("贵州茅台")
+
+
+def test_sina_name_search_resolves_chinese_stock_name(monkeypatch):
+    class Response:
+        content = (
+            'var suggestdata="德明利,11,001309,sz001309,德明利,,德明利,99,1,ESG,,";'
+        ).encode("gbk")
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(
+        "stock_analysis.data.requests.get",
+        lambda *args, **kwargs: Response(),
+    )
+    provider = object.__new__(PublicDataProvider)
+    provider.ak = None
+    result = provider.resolve_candidates("德明利")
+    assert result == [Security("001309", "德明利", "SZSE")]
 
 
 def _tencent_response(rows: list[list[str]]) -> object:
