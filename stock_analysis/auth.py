@@ -329,7 +329,22 @@ def ensure_authenticated() -> bool:
         return False
 
     clear_browser = bool(st.session_state.pop("_clear_browser_session", False))
-    browser_session_storage(st.session_state.get("supabase_session"), clear=clear_browser)
+    try:
+        browser_session_storage(
+            st.session_state.get("supabase_session"), clear=clear_browser
+        )
+    except Exception:
+        # Browser storage is only a convenience for restoring a session after
+        # refresh. It must never prevent the normal login form or the main app
+        # from rendering when a hosted Streamlit runtime rejects component
+        # state updates.
+        st.session_state["supabase_browser_ready"] = True
+        if not st.session_state.get("_browser_storage_warning_shown", False):
+            st.session_state["_browser_storage_warning_shown"] = True
+            st.warning(
+                "浏览器自动恢复登录暂时不可用；本次仍可正常登录，刷新后可能需要重新登录。",
+                icon=":material/warning:",
+            )
     if not st.session_state.get("supabase_browser_ready", False):
         st.info("正在尝试恢复登录状态；如果没有自动恢复，也可以直接登录。")
 

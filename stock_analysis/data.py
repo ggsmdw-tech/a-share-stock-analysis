@@ -306,7 +306,9 @@ class PublicDataProvider(StockDataProvider):
     ) -> pd.DataFrame:
         self.last_market_data_note = ""
         self.last_market_data_source = self.source_name
-        deadline = time.monotonic() + 45.0
+        # Keep a failed public endpoint from making a Streamlit click look
+        # frozen. The individual sources below share one deadline.
+        deadline = time.monotonic() + 20.0
 
         try:
             frame = self._load_tencent_market_data(
@@ -316,6 +318,22 @@ class PublicDataProvider(StockDataProvider):
             return frame
         except Exception as tencent_error:
             tencent_message = str(tencent_error)
+
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                frame = self._load_sina_market_data(
+                    security, start_date, end_date, min(6.0, remaining)
+                )
+                self.last_market_data_source = "sina"
+                self.last_market_data_note = (
+                    "腾讯历史行情接口不可用，已切换新浪公开行情备用源。"
+                )
+                return frame
+        except Exception as sina_error:
+            sina_message = str(sina_error)
+        else:
+            sina_message = "新浪公开行情未在时限内返回数据"
 
         def fetch_range(begin: date, finish: date) -> pd.DataFrame:
             if self.ak is None:
@@ -373,10 +391,71 @@ class PublicDataProvider(StockDataProvider):
             return frame
         except Exception as akshare_error:
             raise RuntimeError(
-                "公开行情暂时无法访问：腾讯历史行情和 AKShare 备用接口均不可用。"
-                f"腾讯原因：{tencent_message}；AKShare原因：{akshare_error}。"
+                "公开行情暂时无法访问：腾讯历史行情和 AKShare 备用接口均不可用；"
+                "新浪公开行情也不可用。"
+                f"腾讯原因：{tencent_message}；新浪原因：{sina_message}；"
+                f"AKShare原因：{akshare_error}。"
                 "请检查本机网络或稍后重试。"
             ) from akshare_error
+
+    def _load_sina_market_data(
+        self,
+        security: Security,
+        start_date: date,
+        end_date: date,
+        timeout: float = 6.0,
+    ) -> pd.DataFrame:
+        """Load real daily bars from Sina's public market-data endpoint."""
+        prefix = {"SSE": "sh", "SZSE": "sz", "BSE": "bj"}.get(security.exchange)
+        if prefix is None:
+            raise ValueError(f"不支持的交易所: {security.exchange}")
+        response = requests.get(
+            "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+            "CN_MarketData.getKLineData",
+            params={
+                "symbol": f"{prefix}{security.code}",
+                # Sina's 240-minute scale is its daily K-line endpoint.
+                "scale": 240,
+                "ma": "no",
+                "datalen": 1000,
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://finance.sina.com.cn/",
+            },
+            timeout=max(0.5, float(timeout)),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list) or not payload:
+            raise ValueError("新浪公开行情接口返回空数据")
+        rows = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "date": item.get("day"),
+                    "open": self._number(item.get("open")),
+                    "high": self._number(item.get("high")),
+                    "low": self._number(item.get("low")),
+                    "close": self._number(item.get("close")),
+                    # Sina reports daily volume in shares.
+                    "volume": self._number(item.get("volume")),
+                }
+            )
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            raise ValueError("新浪公开行情接口没有有效K线")
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame[
+            (frame["date"].dt.date >= start_date)
+            & (frame["date"].dt.date <= end_date)
+        ].copy()
+        if frame.empty:
+            raise ValueError("新浪公开行情接口在所选日期范围内没有数据")
+        frame["amount"] = frame["close"] * frame["volume"]
+        return _standardize_bars(frame)
 
     def _load_tencent_market_data(
         self,
@@ -396,7 +475,7 @@ class PublicDataProvider(StockDataProvider):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("public market data deadline exceeded")
-                request_timeout = min(8.0, remaining)
+                request_timeout = min(4.0, remaining)
             else:
                 request_timeout = 8.0
             begin = max(start_date, date(year, 1, 1))
@@ -486,7 +565,7 @@ class PublicDataProvider(StockDataProvider):
             response = requests.get(
                 "https://qt.gtimg.cn/q=" + prefix + code,
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=6,
+                timeout=4,
             )
             response.raise_for_status()
             text = response.content.decode("gb18030", errors="replace")
@@ -540,7 +619,7 @@ class PublicDataProvider(StockDataProvider):
         try:
             frame = _call_with_timeout(
                 self.ak.stock_financial_analysis_indicator,
-                15,
+                8,
                 symbol=security.code,
             )
         except Exception:

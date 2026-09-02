@@ -49,6 +49,7 @@ SOURCE_LABELS = {
     "public": "公开数据",
     "akshare": "AKShare公开数据",
     "tencent": "腾讯公开行情",
+    "sina": "新浪公开行情",
     "sqlite-cache": "本地公开数据缓存",
 }
 FINANCIAL_METRIC_GUIDE = (
