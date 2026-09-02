@@ -1888,18 +1888,23 @@ def main() -> None:
 
     auto_analyze = bool(st.session_state.get("auto_analyze", False))
     st.session_state["auto_analyze"] = False
-    with st.form("analysis_form", border=False):
-        with st.container(horizontal=True, vertical_alignment="bottom"):
-            query = st.text_input(
-                "股票名称或代码",
-                placeholder="例如：600519、sh.600519 或 贵州茅台",
-                key="analysis_query",
-            )
-            submitted = st.form_submit_button(
-                "开始分析",
-                type="primary",
-                icon=":material/search:",
-            )
+    # Keep the search input and action as ordinary widgets.  This avoids a
+    # hosted Streamlit form-submit event being swallowed while the browser
+    # session component is restoring authentication.  The text input already
+    # persists its value through its key, and no network call happens while
+    # the user is typing; the expensive work still starts only on button click.
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        query = st.text_input(
+            "股票名称或代码",
+            placeholder="例如：600519、sh.600519 或 贵州茅台",
+            key="analysis_query",
+        )
+        submitted = st.button(
+            "开始分析",
+            type="primary",
+            icon=":material/search:",
+            key="start_analysis_button",
+        )
     analyze = submitted or auto_analyze
     analysis_feedback_slot = st.container()
     st.caption("支持6位股票代码、带交易所前缀的代码或股票名称；公开数据异常时不会生成买卖信号。")
