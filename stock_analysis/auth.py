@@ -237,7 +237,12 @@ def session_to_dict(session: Any) -> dict[str, Any] | None:
 
 def _clear_auth_state(*, clear_browser: bool = False) -> None:
     """Remove identity state before showing the login gate again."""
-    for key in ("supabase_session", "auth_user_id", "auth_user_email"):
+    for key in (
+        "supabase_session",
+        "auth_user_id",
+        "auth_user_email",
+        "auth_bootstrap_done",
+    ):
         st.session_state.pop(key, None)
     st.session_state["supabase_recovery"] = False
     if clear_browser:
@@ -329,22 +334,26 @@ def ensure_authenticated() -> bool:
         return False
 
     clear_browser = bool(st.session_state.pop("_clear_browser_session", False))
-    try:
-        browser_session_storage(
-            st.session_state.get("supabase_session"), clear=clear_browser
-        )
-    except Exception:
-        # Browser storage is only a convenience for restoring a session after
-        # refresh. It must never prevent the normal login form or the main app
-        # from rendering when a hosted Streamlit runtime rejects component
-        # state updates.
-        st.session_state["supabase_browser_ready"] = True
-        if not st.session_state.get("_browser_storage_warning_shown", False):
-            st.session_state["_browser_storage_warning_shown"] = True
-            st.warning(
-                "浏览器自动恢复登录暂时不可用；本次仍可正常登录，刷新后可能需要重新登录。",
-                icon=":material/warning:",
+    # The browser component is needed to restore a session after a refresh,
+    # but it should not be mounted again on every ordinary widget rerun. On
+    # hosted deployments, repeatedly mounting it can race with button events.
+    if not st.session_state.get("auth_bootstrap_done", False):
+        try:
+            browser_session_storage(
+                st.session_state.get("supabase_session"), clear=clear_browser
             )
+        except Exception:
+            # Browser storage is only a convenience for restoring a session
+            # after refresh. It must never prevent the normal login form or
+            # the main app from rendering when a hosted Streamlit runtime
+            # rejects component state updates.
+            st.session_state["supabase_browser_ready"] = True
+            if not st.session_state.get("_browser_storage_warning_shown", False):
+                st.session_state["_browser_storage_warning_shown"] = True
+                st.warning(
+                    "浏览器自动恢复登录暂时不可用；本次仍可正常登录，刷新后可能需要重新登录。",
+                    icon=":material/warning:",
+                )
     if not st.session_state.get("supabase_browser_ready", False):
         st.info("正在尝试恢复登录状态；如果没有自动恢复，也可以直接登录。")
 
@@ -392,6 +401,7 @@ def ensure_authenticated() -> bool:
                             except Exception as exc:
                                 st.error(translate_auth_error(exc))
                     return False
+                st.session_state["auth_bootstrap_done"] = True
                 return True
         except Exception:
             _clear_auth_state(clear_browser=True)
