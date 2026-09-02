@@ -1897,13 +1897,18 @@ def main() -> None:
     show_strategy_guide()
 
     request_key = query.strip()
-    if st.session_state.get("analysis_key") != request_key:
-        st.session_state.pop("analysis", None)
+    # Keep the last successful result while the user edits the next query.
+    # Streamlit reruns on widget changes, and clearing analysis here made
+    # a temporary lookup/network failure look like the whole app had lost its
+    # result. A result is replaced only after a new analysis succeeds.
+    error_query = st.session_state.get("analysis_error_query")
+    if error_query and error_query != request_key:
         st.session_state.pop("analysis_error", None)
+        st.session_state.pop("analysis_error_query", None)
 
     if analyze:
-        st.session_state.pop("analysis", None)
         st.session_state["analysis_error"] = ""
+        st.session_state.pop("analysis_error_query", None)
         st.session_state["analysis_alerts"] = []
         try:
             with st.spinner("正在获取数据并计算指标…"):
@@ -1940,10 +1945,26 @@ def main() -> None:
                 pass
         except Exception as exc:
             st.session_state["analysis_error"] = str(exc)
-            st.session_state["analysis_key"] = request_key
+            st.session_state["analysis_error_query"] = request_key
 
     if st.session_state.get("analysis_error"):
         st.error(st.session_state.analysis_error)
+        if "analysis" in st.session_state:
+            previous_key = st.session_state.get("analysis_key", "")
+            if previous_key and previous_key != request_key:
+                st.caption(
+                    "\u4ecd\u663e\u793a\u4e0a\u4e00\u6b21\u6210\u529f\u5206\u6790\u7ed3\u679c\uff08\u67e5\u8be2\uff1a"
+                    f"{previous_key}\uff09\uff1b\u65b0\u67e5\u8be2\u6210\u529f\u540e\u4f1a\u81ea\u52a8\u66ff\u6362\u3002"
+                )
+
+    if "analysis" in st.session_state and st.session_state.get("analysis_key") != request_key:
+        if not st.session_state.get("analysis_error"):
+            previous_key = st.session_state.get("analysis_key", "")
+            if previous_key:
+                st.info(
+                    "\u5f53\u524d\u663e\u793a\u7684\u662f\u4e0a\u4e00\u6b21\u6210\u529f\u5206\u6790\u7ed3\u679c\uff08\u67e5\u8be2\uff1a"
+                    f"{previous_key}\uff09\uff1b\u70b9\u51fb\u201c\u5f00\u59cb\u5206\u6790\u201d\u540e\u624d\u4f1a\u66ff\u6362\u4e3a\u65b0\u67e5\u8be2\u3002"
+                )
 
     if "analysis" not in st.session_state:
         st.markdown("### 从这里开始")
